@@ -8,6 +8,9 @@
 
 [中文说明](README.zh.md)
 
+<img width="1254" height="1254" alt="3de7748e736e3185d5a6b84ef6016c1c" src="https://github.com/user-attachments/assets/65ba0a6a-045f-4cb1-bf2e-9b14b5a08e3f" />
+
+
 ---
 
 ## What it does
