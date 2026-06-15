@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-meeting-transcriber — transcribe.py
+simple-video-transcriber — transcribe.py
 Transcribe a meeting recording with speaker labels.
 
 Usage:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-meeting-transcriber — gui.py
+simple-video-transcriber — gui.py
 Minimal GUI. Follows system dark/light theme. UI language: EN / 中文.
 
 Optional: pip install tkinterdnd2   (enables drag-and-drop)
@@ -117,7 +117,7 @@ THEMES = {
 # ── i18n ──────────────────────────────────────────────────────────────────────
 I18N = {
     "en": {
-        "title":         "meeting-transcriber",
+        "title":         "Simple Video Transcriber",
         "subtitle":      "Transcribe meetings with speaker labels",
         "drop_hint":     "Drop video here  ·  or click to browse",
         "no_file":       "No file selected",
@@ -251,7 +251,7 @@ class App(TkinterDnD.Tk if _DND else tk.Tk):
         self._var_outdir = tk.StringVar(
             value=_us.get("transcript_dir", str(config.TRANSCRIPT_DIR)))
 
-        self.title("meeting-transcriber")
+        self.title("Simple Video Transcriber")
         self.resizable(False, False)
         self.configure(bg=self._c["bg"])
         self.option_add("*Font", FONT)

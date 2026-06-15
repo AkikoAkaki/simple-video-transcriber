@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-meeting-transcriber — watch.py
+simple-video-transcriber — watch.py
 Watches WATCH_DIR for new video files and triggers transcription automatically.
 
 Usage:

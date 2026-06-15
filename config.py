@@ -1,5 +1,5 @@
 """
-meeting-transcriber configuration
+simple-video-transcriber configuration
 All user-facing settings live here. Edit this file to customize behavior.
 """
 from pathlib import Path
