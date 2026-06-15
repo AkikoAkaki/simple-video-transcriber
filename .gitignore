@@ -11,8 +11,11 @@ cache/**
 !cache/.gitkeep
 
 # Secrets
-hf_token.txt
+hf_token.txt*
 .env
+
+# User-local settings (output dir preference, etc.)
+user_settings.json
 
 # Logs
 watch.log
