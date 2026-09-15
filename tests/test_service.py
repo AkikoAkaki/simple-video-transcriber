@@ -1678,6 +1678,3 @@ def test_clear_audio_cache_preserves_generic_stem_without_fingerprint(tmp_path):
     assert generic_partial_b.exists()
     assert orphan_generic.exists()
     assert result["deleted_count"] == 3
-
-
-
