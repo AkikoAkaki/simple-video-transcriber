@@ -7,7 +7,6 @@ package.  The heavy work remains in ``transcribe.py`` child processes.
 
 from __future__ import annotations
 
-import os
 import json
 import sys
 from datetime import datetime

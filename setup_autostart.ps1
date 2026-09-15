@@ -13,13 +13,15 @@ $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $regName = "SimpleVideoTranscriber"
 
 # 1. Always unregister any legacy Scheduled Task if present
-try {
-    $existingTask = Get-ScheduledTask -TaskName $regName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        Unregister-ScheduledTask -TaskName $regName -Confirm:$false -ErrorAction SilentlyContinue
-        Write-Host "[OK] Cleaned up legacy Windows Scheduled Task '$regName'."
-    }
-} catch {}
+foreach ($legacyTaskName in @($regName, "MeetingTranscriber-Watcher")) {
+    try {
+        $existingTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "[OK] Cleaned up legacy Windows Scheduled Task '$legacyTaskName'."
+        }
+    } catch {}
+}
 
 if ($Uninstall) {
     Remove-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue
@@ -53,11 +55,11 @@ Write-Host "     (Runs via Explorer desktop session, immune to laptop battery po
 Write-Host ""
 
 if ($StartNow) {
-    Start-Process -FilePath $pythonw -ArgumentList "`"$script`""
+    Start-Process -FilePath $pythonw -ArgumentList "`"$script`" --tray-only" -WindowStyle Hidden
     Write-Host "[OK] Launched SimpleVideoTranscriber in the background."
 } else {
     Write-Host "To launch right now, run:"
-    Write-Host "  Start-Process `"$pythonw`" -ArgumentList `"`"$script`"`""
+    Write-Host "  Start-Process -FilePath '$pythonw' -ArgumentList '`"$script`" --tray-only' -WindowStyle Hidden"
 }
 Write-Host "To uninstall autostart, run:"
 Write-Host "  powershell -ExecutionPolicy Bypass -File setup_autostart.ps1 -Uninstall"

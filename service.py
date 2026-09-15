@@ -1170,8 +1170,8 @@ class BackgroundService:
             message = message.replace(token, "[redacted]")
         job_id = payload.get("job_id")
         line = f"{timestamp} [{event}] {message}\n"
-        self._log_count += 1
         with self._log_lock:
+            self._log_count += 1
             app_log = LOG_DIR / "app.log"
             if self._log_count % 100 == 0:
                 try:

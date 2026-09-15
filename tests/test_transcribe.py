@@ -1,6 +1,7 @@
 """Tests for pure-logic functions in transcribe.py."""
 import sys
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -944,9 +945,6 @@ def test_cli_and_server_produce_identical_transcripts(tmp_path, monkeypatch):
     assert output.read_text(encoding="utf-8") == cli_text
     assert "SPEAKER_00" in cli_text
     assert "Lecture content." in cli_text
-
-
-import pytest
 
 
 def test_cached_job_skips_audio_and_models_and_keeps_globals(tmp_path, monkeypatch):
