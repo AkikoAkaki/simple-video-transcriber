@@ -885,6 +885,7 @@ class WorkerController:
         return_code = 0
         proc = None
         terminal_kind = None
+        last_worker_error = ""
 
         try:
             proc = self._ensure_server_running()
@@ -894,8 +895,9 @@ class WorkerController:
                 "job_id": job_id,
                 "input_path": str(source),
                 "output_dir": str(out_dir),
-                "model": self.settings.model,
-                "device": self.settings.device,
+                "model": options.get("model", self.settings.model),
+                "device": options.get("device", self.settings.device),
+                "title": options.get("title", ""),
                 "max_speakers": spk if spk and str(spk).lower() != "auto" else None,
                 "num_speakers": exact_spk if exact_spk and str(exact_spk).lower() != "auto" else None,
                 "language": lang,
@@ -932,6 +934,8 @@ class WorkerController:
                     elif event:
                         self.on_event("log", {"job_id": job_id, "message": event["message"]})
                 else:
+                    if any(marker in line.lower() for marker in ("error", "could not load", "cannot load", "invalid handle", "fatal")):
+                        last_worker_error = line
                     self.on_event("log", {"job_id": job_id, "message": line})
 
             # A terminal worker event is authoritative: a completed event
@@ -943,11 +947,16 @@ class WorkerController:
                 if ret is not None and ret != 0:
                     return_code = ret
                 worker_failed = True
+                message = "Worker connection closed before a terminal event"
+                if last_worker_error:
+                    message = f"Worker crashed: {last_worker_error}"
+                if ret is not None:
+                    message += f" (exit code {ret})"
                 self.store.update_if_status(
                     job_id,
                     {"running"},
-                    message="Worker connection closed before a terminal event",
-                    error="Worker connection closed before a terminal event",
+                    message=message,
+                    error=message,
                 )
         except Exception as exc:
             return_code = -1
@@ -992,7 +1001,8 @@ class WorkerController:
                               message=final_message, output_path=output, finished_at=_now())
             self._emit(job_id, final_status,
                        {"stage": "completed", "progress": 1.0,
-                        "message": final_message, "output_path": output})
+                        "message": final_message, "output_path": output,
+                        "error": latest.get("error", "")})
         else:
             message = latest.get("error") or f"Worker exited with code {return_code}"
             self.store.update(job_id, status="failed", stage="failed", message=message,
@@ -1063,12 +1073,7 @@ class BackgroundService:
     def __init__(self, settings: AppSettings | None = None,
                  on_event: Callable[[str, dict], None] | None = None):
         self.settings = settings or AppSettings.load()
-        try:
-            normalize = getattr(config, "normalize_whisper_model", None)
-            if callable(normalize):
-                self.settings.model = normalize(self.settings.model)
-        except Exception:
-            pass
+        self.settings.model = config.normalize_whisper_model(self.settings.model)
         self.settings.save()
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         self.store = JobStore(JOBS_DB)
@@ -1118,10 +1123,24 @@ class BackgroundService:
         self.watcher.rescan()
 
     def add_file(self, path: Path, options: dict = None) -> dict | None:
+        options = dict(options or {})
+        for name in ("model", "device", "language", "max_speakers", "num_speakers", "hotwords"):
+            options.setdefault(name, getattr(self.settings, name))
         row = self.store.create_if_new(path, options)
         if row:
             self.worker.enqueue(row)
         return row
+
+    def retry_job(self, job_id: str) -> dict | None:
+        row = self.store.get(job_id)
+        if not row or row["status"] not in {"failed", "cancelled", "completed_with_warning"}:
+            raise ValueError("Select a failed or cancelled task to retry.")
+        source = Path(row["source_path"])
+        if not source.is_file():
+            raise FileNotFoundError("The original recording was removed. Restore it before retrying.")
+        if self.store.source_key(source)[3] != row["source_key"]:
+            raise ValueError("The recording at this path has changed. Import it as a new task.")
+        return self.add_file(source, json.loads(row["options_json"] or "{}"))
 
     def get_cache_size(self) -> str:
         """Return human-readable cache size."""

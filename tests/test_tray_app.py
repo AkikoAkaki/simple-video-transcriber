@@ -85,6 +85,54 @@ def _mock_app_and_service():
     return app
 
 
+@pytest.mark.parametrize("entry", ["browse", "drop"])
+def test_batch_import_queues_every_supported_file(qapp, tmp_path, monkeypatch, entry):
+    from PySide6.QtCore import QUrl
+    app = _mock_app_and_service()
+    app.service.add_file = MagicMock(return_value={"job_id": "queued"})
+    dashboard = tray_app.Dashboard(app)
+    paths = [tmp_path / "a.m4a", tmp_path / "b.mp4", tmp_path / "ignore.txt"]
+    for path in paths:
+        path.write_bytes(b"file")
+    selection = [str(p) for p in paths] + [str(paths[0])]
+    if entry == "browse":
+        monkeypatch.setattr(tray_app.QFileDialog, "getOpenFileNames", lambda *args: (selection, ""))
+        dashboard._browse_file()
+    else:
+        event = SimpleNamespace(
+            mimeData=lambda: SimpleNamespace(urls=lambda: [QUrl.fromLocalFile(p) for p in selection]),
+            acceptProposedAction=MagicMock(),
+        )
+        dashboard.dropEvent(event)
+    dashboard.manual_title.setText("Course")
+    dashboard._transcribe_manual_file()
+    calls = app.service.add_file.call_args_list
+    assert [c.args[0] for c in calls] == paths[:2]
+    assert [c.args[1]["title"] for c in calls] == ["Course - a", "Course - b"]
+    assert "Queued 2" in dashboard.manual_file.text()
+    assert dashboard._selected_manual_files == []
+
+
+def test_open_result_handles_archived_file_without_recreating_it(qapp, tmp_path, monkeypatch):
+    app = _mock_app_and_service()
+    output = tmp_path / "lecture.md"
+    output.write_text("transcript", encoding="utf-8")
+    app.service.store.get = lambda _: {"output_path": str(output)}
+    dashboard = tray_app.Dashboard(app)
+    dashboard.recent_list.setCurrentRow(0)
+    opened = MagicMock(return_value=True)
+    notice = MagicMock()
+    monkeypatch.setattr(tray_app.QDesktopServices, "openUrl", opened)
+    monkeypatch.setattr(tray_app.QMessageBox, "information", notice)
+    dashboard.recent_list.itemDoubleClicked.emit(dashboard.recent_list.currentItem())
+    assert Path(opened.call_args.args[0].toLocalFile()) == output
+    output.unlink()
+    dashboard._open_result()
+    assert opened.call_count == 1
+    notice.assert_called_once()
+    assert not output.exists()
+
+
 def test_refresh_preserves_selected_job_id(qapp):
     app = _mock_app_and_service()
     dashboard = tray_app.Dashboard(app)
@@ -178,8 +226,44 @@ def test_handle_event_skips_recent_refresh_on_progress_and_heartbeat(qapp, monke
         # Failed event (state transition)
         controller._handle_event("failed", {"message": "Error occurred"})
         assert refresh_args[-1] is True, "failed events must refresh recent_list"
+        assert controller.dashboard.status_label.toolTip() == "Error occurred"
+        controller._handle_event("completed_with_warning", {
+            "message": "Completed with warnings", "error": "Only one speaker identified"})
+        assert controller.dashboard.status_label.toolTip() == "Only one speaker identified"
+        controller._handle_event("log", {"message": "Another log line"})
+        assert controller.dashboard.status_label.toolTip() == "Only one speaker identified"
     finally:
         controller.service.stop()
+
+
+def test_collapsed_options_keep_values_and_log_follows_latest_entry(qapp):
+    from PySide6.QtWidgets import QPushButton
+
+    dashboard = tray_app.Dashboard(_mock_app_and_service())
+    dashboard.show()
+    toggles = dashboard.findChildren(QPushButton, "sectionToggle")
+    assert len(toggles) == 3
+    assert all(not toggle.isChecked() for toggle in toggles)
+    assert dashboard.manual_title.isVisible()
+    assert not dashboard.manual_lang.isVisible()
+    options = next(toggle for toggle in toggles if toggle.text() == "Transcription options")
+    options.click()
+    dashboard.manual_lang.setCurrentText("en")
+    assert dashboard.manual_lang.isVisible()
+    options.click()
+    options.click()
+    assert dashboard.manual_lang.currentText() == "en"
+    for i in range(100):
+        dashboard.append_log(f"Segment {i}", "progress")
+    dashboard.log.verticalScrollBar().setValue(0)
+    dashboard.append_log("GPU failed", "failed")
+    qapp.processEvents()
+    bar = dashboard.log.verticalScrollBar()
+    assert bar.value() == bar.maximum()
+    assert "[error] GPU failed" in dashboard.log.toPlainText()
+    assert dashboard.log.textCursor().charFormat().foreground().color().name() == "#b91c1c"
+    assert dashboard.progress.isHidden()
+    dashboard.hide()
 
 
 def test_model_box_uses_single_config_list_and_migrated_value(qapp):

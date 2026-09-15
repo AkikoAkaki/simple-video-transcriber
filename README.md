@@ -6,9 +6,13 @@ A personal Windows tool that turns OBS meeting recordings, iPhone Voice Memos, a
 
 ## Use
 
-- **Manual files:** run `start.bat` or click the tray icon, select or drop a file in the dashboard, and click **Transcribe**.
+- **Manual files:** run `start.bat` or click the tray icon, select or drop one or more files in the dashboard, and click **Transcribe**. Files run sequentially with the same language, speaker-count, and terminology settings for the batch.
 - **OBS recordings:** select the recording folder and enable **Watch in background**. The watcher handles new files appearing while it is running, not an existing archive. Disable it when unnecessary.
 - **Agents / CLI:** call `transcribe.py`. It uses the same pipeline as the dashboard. Success exits with code 0; failure exits with a nonzero code.
+
+**Title** is optional and sets the Markdown heading and filename. For a batch it prefixes each source filename. Output names retain source fingerprints to distinguish replaced files such as repeated `New Recording 4` recordings. CLI: `--title "CSC290 Lecture 3"`.
+
+Double-click a recent task or click **Open result** to open its Markdown. **Retry** requeues a failed or cancelled task with its original settings and the current token. The source recording must still exist and match the original file version; import a replaced recording as a new task. Transcripts moved into Obsidian are not tracked or automatically recreated.
 
 **Full pipeline** includes speaker diarization. Save a HuggingFace token in the dashboard and accept the terms for [speaker-diarization-3.1](https://hf.co/pyannote/speaker-diarization-3.1) and [segmentation-3.0](https://hf.co/pyannote/segmentation-3.0). Without a token or valid diarization cache, or if loading or diarization fails or returns no speaker turns, the task fails and does not publish a new Markdown transcript.
 
@@ -41,10 +45,12 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 ## Files and settings
 
-- `transcripts/`: Markdown containing the source filename, timestamps, and speaker IDs. Source fingerprints distinguish files with the same name and replaced source contents.
+- `transcripts/`: a staging folder for results you can rename and archive in Obsidian. Markdown is fully written before replacing the destination; write failures preserve the existing file. Archives are not automatically moved or deleted.
 - `cache/`: intermediate audio and recognition, diarization, and merged results. **Clear Audio Cache** removes only audio associated with terminal jobs, preserving JSON and Markdown.
 - `%LOCALAPPDATA%/SimpleVideoTranscriber/`: dashboard settings, the job database, and text logs. Existing historical event tables remain intact but receive no new events.
 
 `config.py` supplies defaults. The tray uses settings saved by the dashboard; CLI arguments override the corresponding defaults. The default model is `large-v3-turbo`, with `large-v3` also available; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed in the dashboard or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
+
+Transcription settings are captured when a task is queued. Missing tokens fail early unless a valid diarization cache exists. Matching recognition and diarization caches bypass audio extraction and model execution.
 
 The watcher waits for roughly 15 seconds of stable file size and checks whether the file can be opened. This is a recording-completion heuristic; paused recordings or transfers can trigger early. Source audio/video is neither moved nor deleted, and media links are not added automatically.

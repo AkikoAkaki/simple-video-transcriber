@@ -1,6 +1,7 @@
 """Tests for the light-weight watcher and durable job layer."""
 
 import time
+import pytest
 from pathlib import Path
 
 from service import AppSettings, FileWatcher, JobStore, TokenStore, parse_worker_line
@@ -15,6 +16,40 @@ def _settings(tmp_path: Path) -> AppSettings:
         stable_seconds=1,
         min_file_size_kb=0,
     )
+
+
+def test_retry_preserves_options_and_rejects_replaced_voice_memo(tmp_path, monkeypatch):
+    import json
+    import pytest
+    import service
+    from unittest.mock import MagicMock
+    for name, leaf in (("SETTINGS_FILE", "settings.json"), ("JOBS_DB", "jobs.sqlite3"),
+                       ("TOKEN_FILE", "token.txt"), ("LOG_DIR", "logs")):
+        monkeypatch.setattr(service, name, tmp_path / leaf)
+    svc = service.BackgroundService(_settings(tmp_path))
+    svc.worker.stop()
+    monkeypatch.setattr(svc.worker, "enqueue", MagicMock())
+    try:
+        source = tmp_path / "New Recording 4.m4a"
+        source.write_bytes(b"first recording")
+        original = svc.add_file(source, {"title": "Lecture 1", "language": "en"})
+        svc.store.update(original["job_id"], status="failed")
+        svc.settings.model = "large-v3"
+        retried = svc.retry_job(original["job_id"])
+        assert retried["job_id"] == original["job_id"]
+        assert json.loads(retried["options_json"]) == json.loads(original["options_json"])
+        svc.store.update(original["job_id"], status="failed")
+        source.write_bytes(b"a different recording with the same name")
+        with pytest.raises(ValueError, match="changed"):
+            svc.retry_job(original["job_id"])
+        assert svc.store.get(original["job_id"])["status"] == "failed"
+        new_job = svc.add_file(source)
+        assert new_job["job_id"] != original["job_id"]
+        source.unlink()
+        with pytest.raises(FileNotFoundError, match="removed"):
+            svc.retry_job(original["job_id"])
+    finally:
+        svc.stop()
 
 
 def test_watcher_baselines_existing_files_and_emits_new_file(tmp_path):
@@ -1046,7 +1081,8 @@ def test_server_startup_requires_ready_confirmation(tmp_path, monkeypatch):
     controller.stop()
 
 
-def test_server_eof_cannot_reuse_stale_output_as_success(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stderr,exit_code", [("", 0), ("Could not load symbol cudnnGetLibConfig. Error code 127", 1)])
+def test_server_eof_cannot_reuse_stale_output_as_success(tmp_path, monkeypatch, stderr, exit_code):
     from paths import transcript_path
     from service import WorkerController
 
@@ -1058,6 +1094,7 @@ def test_server_eof_cannot_reuse_stale_output_as_success(tmp_path, monkeypatch):
         TokenStore(tmp_path / "token.txt"),
         lambda *_: None,
     )
+    controller.stop()
     source = tmp_path / "stale-output.mp4"
     source.write_bytes(b"data")
     job = store.create_if_new(source)
@@ -1074,10 +1111,10 @@ def test_server_eof_cannot_reuse_stale_output_as_success(tmp_path, monkeypatch):
 
     class Proc:
         stdin = Input()
-        stdout = iter([])
+        stdout = iter([stderr] if stderr else [])
 
         def poll(self):
-            return 0
+            return exit_code
 
     monkeypatch.setattr(controller, "_ensure_server_running", lambda: Proc())
 
@@ -1085,7 +1122,9 @@ def test_server_eof_cannot_reuse_stale_output_as_success(tmp_path, monkeypatch):
 
     current = store.get(job["job_id"])
     assert current["status"] == "failed"
-    assert current["error"] == "Worker connection closed before a terminal event"
+    assert current["error"] == (f"Worker crashed: {stderr}" if stderr else
+                                "Worker connection closed before a terminal event") + f" (exit code {exit_code})"
+    assert old_output.read_text(encoding="utf-8") == "old transcript"
     controller.stop()
 
 

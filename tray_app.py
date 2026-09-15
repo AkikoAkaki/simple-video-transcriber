@@ -8,6 +8,7 @@ package.  The heavy work remains in ``transcribe.py`` child processes.
 from __future__ import annotations
 
 import os
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ import config
 
 try:
     from PySide6.QtCore import QObject, QLockFile, Qt, QUrl, Signal
-    from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap
+    from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap, QTextCursor, QTextCharFormat
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QFileDialog,
         QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -58,11 +59,27 @@ if QT_AVAILABLE:
         return icon
 
 
-    def _card(title: str) -> tuple[QGroupBox, QVBoxLayout]:
-        group = QGroupBox(title)
+    def _card(title: str, collapsible: bool = False) -> tuple[QGroupBox, QVBoxLayout]:
+        group = QGroupBox("" if collapsible else title)
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(8)
+        if collapsible:
+            group.setObjectName("collapsibleSection")
+            toggle = QPushButton(title)
+            toggle.setIcon(group.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight))
+            toggle.setCheckable(True)
+            toggle.setObjectName("sectionToggle")
+            layout.addWidget(toggle)
+            content = QWidget()
+            inner = QVBoxLayout(content)
+            inner.setContentsMargins(0, 4, 0, 0)
+            content.setVisible(False)
+            toggle.toggled.connect(content.setVisible)
+            toggle.toggled.connect(lambda expanded: toggle.setIcon(group.style().standardIcon(
+                QStyle.StandardPixmap.SP_ArrowDown if expanded else QStyle.StandardPixmap.SP_ArrowRight)))
+            layout.addWidget(content)
+            return group, inner
         return group, layout
 
 
@@ -70,10 +87,10 @@ if QT_AVAILABLE:
         def __init__(self, app: "TrayApp"):
             super().__init__()
             self.app = app
-            self._selected_manual_file = None
+            self._selected_manual_files = []
             self.setWindowTitle("Simple Video Transcriber")
             self.setMinimumSize(640, 620)
-            self.resize(720, 760)
+            self.resize(820, 980)
             self.setObjectName("window")
             self.setAcceptDrops(True)
             self._build()
@@ -92,13 +109,11 @@ if QT_AVAILABLE:
             title_box = QVBoxLayout()
             title = QLabel("Simple Video Transcriber")
             title.setObjectName("title")
-            subtitle = QLabel("Local transcription · OBS folder watcher")
-            subtitle.setObjectName("subtitle")
             title_box.addWidget(title)
-            title_box.addWidget(subtitle)
             header_layout.addLayout(title_box)
             header_layout.addStretch()
             self.status_label = QLabel("Starting…")
+            self.status_label.setToolTip("Starting the background service")
             self.status_label.setObjectName("statusPill")
             header_layout.addWidget(self.status_label, alignment=Qt.AlignmentFlag.AlignTop)
             root_layout.addWidget(header)
@@ -109,20 +124,26 @@ if QT_AVAILABLE:
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             body = QWidget()
             body_layout = QVBoxLayout(body)
-            body_layout.setContentsMargins(24, 20, 24, 24)
-            body_layout.setSpacing(14)
+            body_layout.setContentsMargins(16, 12, 16, 16)
+            body_layout.setSpacing(8)
 
             drop, drop_layout = _card("Manual transcription")
             row = QHBoxLayout()
-            self.manual_file = QLabel("Drop a video/audio file here or browse")
+            self.manual_file = QLabel("Drop video/audio files here or browse")
             self.manual_file.setObjectName("dropHint")
             self.manual_file.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             row.addWidget(self.manual_file)
-            browse = QPushButton("Browse file")
+            browse = QPushButton("Browse files")
             browse.clicked.connect(self._browse_file)
             row.addWidget(browse)
             drop_layout.addLayout(row)
 
+            self.manual_title = QLineEdit()
+            self.manual_title.setPlaceholderText("Optional title; used as a prefix when selecting multiple files")
+            title_form = QFormLayout()
+            title_form.addRow("Title", self.manual_title)
+            drop_layout.addLayout(title_form)
+            options, options_layout = _card("Transcription options", collapsible=True)
             options_form = QFormLayout()
             options_form.setSpacing(6)
 
@@ -147,7 +168,8 @@ if QT_AVAILABLE:
             options_form.addRow("Max speakers", self.manual_speakers)
             options_form.addRow("Exact speakers", self.manual_exact_speakers)
             options_form.addRow("Names / terms", self.manual_hotwords)
-            drop_layout.addLayout(options_form)
+            options_layout.addLayout(options_form)
+            drop_layout.addWidget(options)
 
             action_row = QHBoxLayout()
             self.transcribe_btn = QPushButton("Transcribe")
@@ -159,7 +181,7 @@ if QT_AVAILABLE:
 
             body_layout.addWidget(drop)
 
-            watch, watch_layout = _card("Automatic OBS watcher")
+            watch, watch_layout = _card("Automatic OBS watcher", collapsible=True)
             path_row = QHBoxLayout()
             self.watch_path = QLabel()
             self.watch_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -179,7 +201,6 @@ if QT_AVAILABLE:
             control_row.addWidget(self.watch_detail)
             control_row.addStretch()
             watch_layout.addLayout(control_row)
-            body_layout.addWidget(watch)
 
             current, current_layout = _card("Current task")
             self.current_name = QLabel("No active task")
@@ -193,7 +214,9 @@ if QT_AVAILABLE:
             self.progress = QProgressBar()
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
-            self.progress.setTextVisible(True)
+            self.progress.setTextVisible(False)
+            self.progress.setFixedHeight(6)
+            self.progress.hide()
             current_layout.addWidget(self.progress)
             self.preview_label = QLabel("")
             self.preview_label.setObjectName("previewLabel")
@@ -215,10 +238,17 @@ if QT_AVAILABLE:
 
             recent, recent_layout = _card("Recent tasks")
             self.recent_list = QListWidget()
-            self.recent_list.setMinimumHeight(170)
-            self.recent_list.setMaximumHeight(240)
+            self.recent_list.setMinimumHeight(220)
+            self.recent_list.setUniformItemSizes(True)
+            self.recent_list.itemDoubleClicked.connect(lambda _item: self._open_result())
             recent_layout.addWidget(self.recent_list)
             recent_buttons = QHBoxLayout()
+            open_result = QPushButton("Open result")
+            open_result.clicked.connect(self._open_result)
+            recent_buttons.addWidget(open_result)
+            retry = QPushButton("Retry")
+            retry.clicked.connect(self._retry_job)
+            recent_buttons.addWidget(retry)
             open_transcripts = QPushButton("Open transcripts folder")
             open_transcripts.clicked.connect(self._open_transcripts)
             recent_buttons.addWidget(open_transcripts)
@@ -227,9 +257,9 @@ if QT_AVAILABLE:
             recent_buttons.addWidget(open_logs)
             recent_buttons.addStretch()
             recent_layout.addLayout(recent_buttons)
-            body_layout.addWidget(recent)
+            body_layout.addWidget(recent, 1)
 
-            settings, settings_layout = _card("Advanced settings")
+            settings, settings_layout = _card("Advanced settings", collapsible=True)
             form = QFormLayout()
             self.model_box = QComboBox()
             self.model_box.addItems(list(config.SUPPORTED_MODELS))
@@ -268,16 +298,19 @@ if QT_AVAILABLE:
             cache_row.addWidget(self.clear_cache_btn)
             settings_layout.addLayout(cache_row)
 
-            body_layout.addWidget(settings)
 
             logs, logs_layout = _card("Readable activity log")
             self.log = QPlainTextEdit()
             self.log.setReadOnly(True)
             self.log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
             self.log.setMaximumBlockCount(500)
-            self.log.setMinimumHeight(180)
+            self.log.setMinimumHeight(230)
+            scrollbar = self.log.verticalScrollBar()
+            scrollbar.rangeChanged.connect(lambda _minimum, maximum: scrollbar.setValue(maximum))
             logs_layout.addWidget(self.log)
-            body_layout.addWidget(logs)
+            body_layout.addWidget(logs, 1)
+            body_layout.addWidget(watch)
+            body_layout.addWidget(settings)
             body_layout.addItem(QSpacerItem(1, 4, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
 
             scroll.setWidget(body)
@@ -286,10 +319,18 @@ if QT_AVAILABLE:
 
         def _browse_file(self):
             extensions = " ".join(f"*{ext}" for ext in sorted(config.WATCH_EXTENSIONS))
-            path, _ = QFileDialog.getOpenFileName(self, "Select video or audio", "", f"Video / Audio ({extensions});;All files (*.*)")
-            if path:
-                self._selected_manual_file = Path(path)
-                self.manual_file.setText(f"Selected: {self._selected_manual_file.name}")
+            paths, _ = QFileDialog.getOpenFileNames(self, "Select video or audio", "", f"Video / Audio ({extensions})")
+            if paths:
+                self._select_files(paths)
+
+        def _select_files(self, paths):
+            self._selected_manual_files = list(dict.fromkeys(
+                Path(path).resolve() for path in paths
+                if Path(path).is_file() and Path(path).suffix.lower() in config.WATCH_EXTENSIONS
+            ))
+            names = [path.name for path in self._selected_manual_files]
+            self.manual_file.setText(f"Selected: {names[0]}" if len(names) == 1 else f"Selected {len(names)} files")
+            self.manual_file.setToolTip("\n".join(str(path) for path in self._selected_manual_files))
 
         def dragEnterEvent(self, event):
             if event.mimeData().hasUrls():
@@ -300,15 +341,11 @@ if QT_AVAILABLE:
         def dropEvent(self, event):
             paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
             if paths:
-                raw = paths[0]
-                path = Path(raw)
-                if path.is_file() and path.suffix.lower() in config.WATCH_EXTENSIONS:
-                    self._selected_manual_file = path
-                    self.manual_file.setText(f"Selected: {path.name}")
+                self._select_files(paths)
             event.acceptProposedAction()
 
         def _transcribe_manual_file(self):
-            if not self._selected_manual_file:
+            if not self._selected_manual_files:
                 QMessageBox.warning(self, "No file selected", "Please select or drop a file first.")
                 return
             options = {
@@ -318,12 +355,40 @@ if QT_AVAILABLE:
                 "num_speakers": self.manual_exact_speakers.currentText(),
                 "hotwords": self.manual_hotwords.toPlainText().strip(),
             }
-            row = self.app.service.add_file(self._selected_manual_file, options)
-            if row:
-                self.manual_file.setText(f"Queued: {self._selected_manual_file.name}")
-                self._selected_manual_file = None
-            else:
-                self.manual_file.setText("This file is already queued or active")
+            title = " ".join(self.manual_title.text().split())
+            multiple = len(self._selected_manual_files) > 1
+            queued = 0
+            for path in self._selected_manual_files:
+                job_title = f"{title} - {path.stem}" if title and multiple else title
+                if self.app.service.add_file(path, {**options, "title": job_title}):
+                    queued += 1
+            skipped = len(self._selected_manual_files) - queued
+            self.manual_file.setText(f"Queued {queued}; skipped {skipped} (already active or unavailable)")
+            self._selected_manual_files = []
+            self.manual_title.clear()
+
+        def _open_result(self):
+            item = self.recent_list.currentItem()
+            row = self.app.service.store.get(item.data(Qt.ItemDataRole.UserRole)) if item else None
+            if not row or not row.get("output_path"):
+                QMessageBox.information(self, "No result", "Select a completed task with a transcript.")
+                return
+            path = Path(row["output_path"])
+            if not path.is_file():
+                QMessageBox.information(self, "Result moved", "This transcript was moved, renamed, or deleted. Check your archive.")
+                return
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+                QMessageBox.warning(self, "Cannot open result", "No application could open this Markdown file.")
+
+        def _retry_job(self):
+            item = self.recent_list.currentItem()
+            if not item:
+                return
+            try:
+                self.app.service.retry_job(item.data(Qt.ItemDataRole.UserRole))
+            except (ValueError, OSError) as exc:
+                QMessageBox.warning(self, "Cannot retry", str(exc))
+            self.refresh()
 
         def _choose_watch_folder(self):
             path = QFileDialog.getExistingDirectory(self, "Select OBS recording folder", self.app.service.settings.watch_dir)
@@ -389,19 +454,24 @@ if QT_AVAILABLE:
             self.watch_toggle.setChecked(settings.watcher_enabled)
             self.watch_toggle.blockSignals(False)
             active = self.app.service.worker.active
+            if active and (self.app.service.store.get(active["job_id"]) or active).get("status") in {"completed", "completed_with_warning", "failed", "cancelled"}:
+                active = None
+            self.elapsed.setVisible(bool(active))
             if active:
                 row = self.app.service.store.get(active["job_id"]) or active
                 self.current_name.setText(Path(row["source_path"]).name)
                 stage = row.get("stage") or "running"
                 message = row.get("message") or stage
                 progress = row.get("progress")
+                self.progress.show()
                 if stage == "transcribing" and isinstance(progress, (int, float)):
                     self.current_stage.setText(
-                        f"Transcribing · {progress:.0%} · {message}")
+                        f"2/4 · Transcription {progress:.0%} · {message}")
                     self.progress.setRange(0, 100)
                     self.progress.setValue(int(max(0, min(1, progress)) * 100))
                 elif stage in {"loading_whisper", "loading_diarization", "diarizing", "converting"}:
-                    self.current_stage.setText(f"{stage.replace('_', ' ').title()} · {message}")
+                    step = "1/4" if stage == "converting" else "2/4" if stage == "loading_whisper" else "3/4"
+                    self.current_stage.setText(f"{step} · {message}")
                     self.progress.setRange(0, 0)
                 elif isinstance(progress, (int, float)):
                     self.current_stage.setText(f"{stage.title()} · {progress:.0%} · {message}")
@@ -411,7 +481,7 @@ if QT_AVAILABLE:
                     self.current_stage.setText(f"{stage.replace('_', ' ').title()} · {message}")
                     self.progress.setRange(0, 0)
                 started = row.get("started_at") or row.get("updated_at")
-                self.elapsed.setText(f"Started {started.replace('T', ' ')[:19]}")
+                self.elapsed.setText(f"Started {datetime.fromisoformat(started).astimezone():%H:%M:%S}" if started else "")
                 self.cancel_button.setVisible(True)
                 preview = active.get("preview")
                 if preview:
@@ -419,11 +489,11 @@ if QT_AVAILABLE:
             else:
                 self.current_name.setText("No active task")
                 self.current_stage.setText("The worker is idle.")
-                self.progress.setRange(0, 100)
-                self.progress.setValue(0)
+                self.progress.hide()
                 self.elapsed.setText("")
                 self.cancel_button.setVisible(False)
                 self.preview_label.setText("")
+            self.preview_label.setVisible(bool(self.preview_label.text()))
             if update_recent:
                 self._update_cache_display()
                 self.refresh_recent_list()
@@ -439,21 +509,41 @@ if QT_AVAILABLE:
             self.recent_list.clear()
             restore_item = None
             for row in rows:
-                name = Path(row["source_path"]).name
-                status = row["status"].replace("_", " ")
-                stamp = row["updated_at"].replace("T", " ")[:19]
-                item = QListWidgetItem(f"{status.upper():<24} {name}    {stamp}")
+                name = json.loads(row.get("options_json") or "{}").get("title") or Path(row["source_path"]).name
+                status = row["status"]
+                label = {"completed": "Done", "completed_with_warning": "Warning", "cancel_requested": "Cancelling"}.get(status, status.capitalize())
+                stamp = datetime.fromisoformat(row["updated_at"]).astimezone().strftime("%m-%d %H:%M")
+                item = QListWidgetItem(f"{stamp}  ·  {label}  ·  {name}")
                 item.setData(Qt.ItemDataRole.UserRole, row["job_id"])
-                item.setToolTip(row.get("message", ""))
+                item.setToolTip(f"{name}\n{row.get('error') or row.get('message', '')}")
+                if status in {"failed", "completed_with_warning"}:
+                    item.setForeground(QColor("#b91c1c" if status == "failed" else "#a16207"))
                 self.recent_list.addItem(item)
                 if selected_job_id is not None and row["job_id"] == selected_job_id:
                     restore_item = item
             if restore_item is not None:
                 self.recent_list.setCurrentItem(restore_item)
 
-        def append_log(self, message: str):
+        def append_log(self, message: str, event: str = "log"):
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.log.appendPlainText(f"{timestamp}  {message}")
+            lower = message.lower()
+            if event in {"failed", "watch_error"} or any(word in lower for word in ("error", "traceback", "could not load", "cannot load", "fatal")):
+                tag, color = "error", "#b91c1c"
+            elif event in {"warning", "completed_with_warning"} or "warning" in lower or "[warn]" in lower:
+                tag, color = "warn", "#a16207"
+            elif event in {"stage", "progress", "heartbeat"} or "segments, up to" in lower:
+                tag, color = "run", "#2563eb"
+            else:
+                tag, color = "info", "#475569"
+            cursor = self.log.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            style = QTextCharFormat()
+            style.setForeground(QColor(color))
+            if not self.log.document().isEmpty():
+                cursor.insertBlock()
+            cursor.insertText(f"{timestamp} [{tag}] {message}", style)
+            self.log.setTextCursor(cursor)
+            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
 
     class TrayApp(QObject):
@@ -465,23 +555,28 @@ if QT_AVAILABLE:
                 QWidget#window { background: #f5f7fb; color: #172033; }
                 QFrame#header { background: #ffffff; border-bottom: 1px solid #e5e7eb; }
                 QLabel#title { font-size: 20px; font-weight: 700; color: #111827; }
-                QLabel#subtitle, QLabel#muted { color: #6b7280; }
+                QLabel#muted { color: #6b7280; }
                 QLabel#statusPill { background: #eaf2ff; color: #2563eb; border-radius: 10px; padding: 6px 10px; font-weight: 600; }
+                QLabel#statusPill[tone="error"] { background: #fee2e2; color: #b91c1c; }
+                QLabel#statusPill[tone="warning"] { background: #fef3c7; color: #92400e; }
                 QLabel#currentName { font-size: 15px; font-weight: 600; color: #111827; }
                 QLabel#previewLabel { color: #4b5563; font-style: italic; min-height: 18px; margin-top: 2px; }
                 QLabel#dropHint, QLabel#pathLabel { color: #4b5563; }
                 QGroupBox { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; margin-top: 8px; padding-top: 12px; font-weight: 600; }
                 QGroupBox::title { subcontrol-origin: margin; left: 14px; padding: 0 5px; color: #374151; }
+                QGroupBox#collapsibleSection { margin-top: 0; padding-top: 0; }
                 QPushButton { background: #eef2f7; border: 0; border-radius: 7px; padding: 8px 12px; color: #1f2937; }
                 QPushButton:hover { background: #e1e7ef; }
+                QPushButton#sectionToggle { background: transparent; text-align: left; padding: 2px; font-weight: 600; color: #374151; }
+                QPushButton#sectionToggle:hover { background: #eef2f7; }
                 QPushButton#dangerButton { background: #fee2e2; color: #b91c1c; }
                 QPushButton#accentButton { background: #2563eb; color: #ffffff; font-weight: 600; }
                 QPushButton#accentButton:hover { background: #1d4ed8; }
                 QPushButton#accentButton:disabled { background: #9ca3af; color: #e5e7eb; }
-                QProgressBar { border: 0; border-radius: 6px; background: #e5e7eb; height: 12px; text-align: center; color: #374151; }
-                QProgressBar::chunk { background: #3b82f6; border-radius: 6px; }
+                QProgressBar { border: 0; border-radius: 3px; background: #e5e7eb; }
+                QProgressBar::chunk { background: #3b82f6; border-radius: 3px; }
                 QListWidget, QPlainTextEdit, QLineEdit, QComboBox { background: #fbfcfe; border: 1px solid #e5e7eb; border-radius: 7px; padding: 5px; }
-                QListWidget::item { padding: 6px 2px; }
+                QListWidget::item { padding: 3px 2px; }
                 QScrollArea { background: #f5f7fb; }
                 """
             )
@@ -571,7 +666,8 @@ if QT_AVAILABLE:
                 if event == "failed":
                     self.tray.showMessage("Transcription failed", message, QSystemTrayIcon.MessageIcon.Critical, 7000)
             elif event in {"detected", "ready", "queued", "started", "stage", "progress", "heartbeat"}:
-                self.tray.setIcon(_make_icon("#3b82f6"))
+                if event not in {"progress", "heartbeat"}:
+                    self.tray.setIcon(_make_icon("#3b82f6"))
                 self.dashboard.status_label.setText("● Processing")
                 self._update_tooltip()
             elif event in {"completed", "completed_with_warning"}:
@@ -582,16 +678,32 @@ if QT_AVAILABLE:
             elif event == "watch_stopped":
                 self.dashboard.status_label.setText("● Paused")
                 self._update_tooltip()
+            elif event == "cancelled":
+                self.dashboard.status_label.setText("● Cancelled")
+            elif event == "cancel_requested":
+                self.dashboard.status_label.setText("● Cancelling")
+            if event != "log":
+                detail = payload.get("error") or message
+                if event == "completed_with_warning" and not payload.get("error"):
+                    row = self.service.store.get(payload.get("job_id", "")) or {}
+                    detail = row.get("error") or message
+                if event == "service_started" and not Path(self.service.settings.watch_dir).exists() and self.service.settings.watcher_enabled:
+                    detail = f"Watch folder unavailable: {self.service.settings.watch_dir}"
+                self.dashboard.status_label.setToolTip(detail)
+                tone = "error" if event in {"failed", "watch_error"} else "warning" if event == "completed_with_warning" else "normal"
+                pill = self.dashboard.status_label
+                if pill.property("tone") != tone:
+                    pill.setProperty("tone", tone)
+                    pill.style().unpolish(pill)
+                    pill.style().polish(pill)
             if event == "progress":
                 preview = payload.get("preview")
                 if preview:
                     self.dashboard.preview_label.setText(preview)
             elif event in {"completed", "completed_with_warning", "failed", "cancelled", "started", "queued"}:
                 self.dashboard.preview_label.setText("")
-            if event == "log":
-                self.dashboard.append_log(message)
-            elif event not in {"progress", "heartbeat"}:
-                self.dashboard.append_log(message)
+            if event not in {"progress", "heartbeat"}:
+                self.dashboard.append_log(message, event)
             if self.dashboard.isVisible():
                 is_state_transition = event in {
                     "queued", "started", "completed", "completed_with_warning",

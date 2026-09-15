@@ -6,9 +6,13 @@
 
 ## 使用
 
-- **手动转录**：双击 `start.bat`，或点击托盘图标打开 dashboard，选择或拖入文件，点击 **Transcribe**。
+- **手动转录**：双击 `start.bat`，或点击托盘图标打开 dashboard，可一次选择或拖入多个音视频文件，点击 **Transcribe** 后依次处理。同一次导入使用相同的语言、人数和术语设置。
 - **OBS 录屏**：在 dashboard 设置录制目录并开启 **Watch in background**。只自动处理监听期间出现的新文件，不批量处理启动前的存档。暂不需要时关闭监听即可。
 - **agent / 命令行**：调用 `transcribe.py`，与 dashboard 使用同一转录流程。成功退出码为 0，失败为非零。
+
+**Title** 可留空；填写后用于 Markdown 标题和文件名。多文件导入时作为前缀，后接各自原文件名。输出文件名始终保留源文件指纹，重复出现的 `New Recording 4` 会按不同文件版本区分。命令行可用 `--title "CSC290 Lecture 3"`。
+
+最近任务可双击或点击 **Open result** 打开 Markdown；选中失败或取消的任务后点击 **Retry**，沿用原任务设置并使用当前 Token。重试需要原音视频仍在且未被替换；改了内容的同名录音必须重新导入。已搬到 Obsidian 的 transcript 不会被工具追踪或自动重建。
 
 默认 **Full pipeline** 包含说话人分离，需要在 dashboard 保存 HuggingFace Token，并接受 [speaker-diarization-3.1](https://hf.co/pyannote/speaker-diarization-3.1) 和 [segmentation-3.0](https://hf.co/pyannote/segmentation-3.0) 的使用条款。缺少 Token 且无可用分离缓存、模型加载失败、分离运行失败或没有分离结果时，任务标记为失败，不发布本次 Markdown。
 
@@ -41,10 +45,12 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 ## 输出与配置
 
-- `transcripts/`：Markdown 文件，包含源文件名、时间戳和说话人编号。源文件指纹用于区分同名文件及被替换的内容。
+- `transcripts/`：转录结果的中转目录，可自行重命名并归档到 Obsidian。Markdown 写入完整后才替换正式文件；写入失败保留已有文件。工具不自动搬运或删除归档。
 - `cache/`：音频中间文件和识别、分离、合并结果。**Clear Audio Cache** 只清理与已结束任务关联的音频缓存，保留 JSON 和 Markdown。
 - `%LOCALAPPDATA%/SimpleVideoTranscriber/`：dashboard 设置、任务数据库和文本日志。已有历史事件表保留，但不再写入新事件。
 
 `config.py` 提供默认设置；dashboard 保存的设置供托盘使用，命令行参数覆盖对应默认值。默认模型为 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在 dashboard 修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
+
+任务入队时保存转录设置。缺少 Token 且没有可用分离缓存时提前失败；识别和分离缓存均匹配时，跳过音频提取和模型运行。
 
 监听器等待文件大小稳定约 15 秒并检查文件能否打开；这是完成录制的近似判断，暂停录制或传输可能提前触发。输出不会移动或删除原始音视频，也不会自动添加媒体链接。

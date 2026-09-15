@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import argparse
+import tempfile
 from pathlib import Path
 
 # Force UTF-8 stdout so Unicode characters (checkmarks, arrows, em-dashes)
@@ -26,24 +27,6 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-
-# On Windows, ensure CTranslate2 can load cuBLAS / cuDNN from torch/lib to prevent silent CPU fallback
-_TORCH_DLL_HANDLE = None
-if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-    try:
-        import importlib.util
-        _spec = importlib.util.find_spec("torch")
-        if _spec and _spec.submodule_search_locations:
-            for _loc in _spec.submodule_search_locations:
-                _cand = Path(_loc) / "lib"
-                if _cand.is_dir():
-                    _TORCH_DLL_HANDLE = os.add_dll_directory(str(_cand))
-                    cand_str = str(_cand)
-                    if cand_str not in os.environ.get("PATH", ""):
-                        os.environ["PATH"] = cand_str + os.pathsep + os.environ.get("PATH", "")
-                    break
-    except Exception:
-        pass
 
 import warnings
 import logging
@@ -75,6 +58,8 @@ def _cache_key(kind: str, **params) -> str:
 def _read_stage_payload(path: Path, kind: str, cache_key: str | None) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
     except (json.JSONDecodeError, OSError):
         print(f"[WARN] {kind} cache is corrupt — re-running...", flush=True)
         try:
@@ -149,10 +134,7 @@ def _whisper_cache_key(model_name: str, device: str, language: str | None,
                        initial_prompt: str | None = None) -> str:
     compute_type = "float16" if device == "cuda" else "int8"
     if initial_prompt is None:
-        try:
-            initial_prompt = select_initial_prompt(language)
-        except Exception:
-            initial_prompt = None
+        initial_prompt = select_initial_prompt(language)
     return _cache_key(
         "whisper", model=model_name, device=device, compute_type=compute_type,
         language=language or "auto", hotwords=hotwords or "",
@@ -293,6 +275,8 @@ _whisper_model = None
 _whisper_model_params = None
 
 def get_whisper_model(model_name: str, device: str, compute_type: str):
+    if device == "cuda":
+        _load_cuda_libraries()
     global _whisper_model, _whisper_model_params
     params = (model_name, device, compute_type)
     if _whisper_model is None or _whisper_model_params != params:
@@ -380,8 +364,30 @@ def clear_diarize_pipeline() -> None:
 
 
 
-def _resolve_device() -> str:
-    if config.DEVICE == "auto":
+_CUDA_DLL_HANDLES = []
+
+
+def _load_cuda_libraries():
+    """Load one complete cuDNN suite before CTranslate2 loads its bundled core."""
+    if sys.platform != "win32" or _CUDA_DLL_HANDLES:
+        return
+    import ctypes
+    import torch
+
+    lib = Path(torch.__file__).parent / "lib"
+    handles = [os.add_dll_directory(str(lib))]
+    # PATH alone does not prevent mixing CTranslate2's core with Torch's
+    # sub-libraries, which aborts the process at cudnnGetLibConfig.
+    handles.extend(ctypes.WinDLL(str(path)) for path in sorted(lib.glob("cudnn*64_*.dll")))
+    os.environ["PATH"] = str(lib) + os.pathsep + os.environ.get("PATH", "")
+    _CUDA_DLL_HANDLES.extend(handles)
+
+
+def _resolve_device(device: str | None = None) -> str:
+    device = device or config.DEVICE
+    if device != "cpu":
+        _load_cuda_libraries()
+    if device == "auto":
         try:
             import ctranslate2
             if ctranslate2.get_cuda_device_count() > 0:
@@ -395,21 +401,22 @@ def _resolve_device() -> str:
         except Exception:
             pass
         return "cpu"
-    return config.DEVICE
+    return device
 
 
-def derive_paths(input_path: Path) -> dict[str, Path]:
+def derive_paths(input_path: Path, output_dir: Path | None = None, title: str = "") -> dict[str, Path]:
     stem = input_path.stem
     path_hash = source_fingerprint(input_path)
 
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    config.TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = output_dir or config.TRANSCRIPT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
     return {
         "wav":          config.CACHE_DIR      / f"{stem}_{path_hash}_16k.wav",
         "whisper_json": config.CACHE_DIR      / f"_{stem}_{path_hash}_whisper.json",
         "diarize_json": config.CACHE_DIR      / f"_{stem}_{path_hash}_diarize.json",
         "segments_json": config.CACHE_DIR    / f"_{stem}_{path_hash}_segments.json",
-        "output_md":    transcript_path(input_path, config.TRANSCRIPT_DIR),
+        "output_md":    transcript_path(input_path, output_dir, path_hash, title),
     }
 
 
@@ -498,7 +505,8 @@ def convert_to_wav(input_path: Path, output_path: Path):
 # ── Step 2: Whisper transcription ─────────────────────────────────────────────
 
 def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
-                hotwords: str | None = None, cache_key: str | None = None) -> list[dict]:
+                hotwords: str | None = None, cache_key: str | None = None,
+                *, model_name: str | None = None, device: str | None = None) -> list[dict]:
     if whisper_json.exists():
         _emit_event("stage", stage="transcribing", progress=1.0,
                     message="Loading cached Whisper result")
@@ -509,7 +517,8 @@ def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
             return segs
         print("[INFO] Whisper cache does not match current settings — re-transcribing...", flush=True)
 
-    device = _resolve_device()
+    device = device or _resolve_device()
+    model_name = model_name or config.WHISPER_MODEL
     compute_type = "float16" if device == "cuda" else "int8"
     if language is None or str(language).strip().lower() in ("", "auto"):
         transcribe_language = None
@@ -517,15 +526,12 @@ def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
     else:
         transcribe_language = language
         lang_display = language
-    MODEL_SIZES = {"large-v3-turbo": "~1.6 GB", "large-v3": "~3.1 GB"}
-    size_hint = MODEL_SIZES.get(config.WHISPER_MODEL, "")
-    print(f"[2/4] Loading Whisper {config.WHISPER_MODEL} on {device} ({compute_type})...", flush=True)
+    print(f"[2/4] Loading Whisper {model_name} on {device} ({compute_type})...", flush=True)
     _emit_event("stage", stage="loading_whisper", progress=0.0,
-                message=f"Loading Whisper {config.WHISPER_MODEL} on {device}")
-    print(f"      (First run: downloading {config.WHISPER_MODEL} {size_hint} — please wait)", flush=True)
+                message=f"Loading Whisper {model_name} on {device}")
 
     try:
-        model = get_whisper_model(config.WHISPER_MODEL, device, compute_type)
+        model = get_whisper_model(model_name, device, compute_type)
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             print("ERROR: GPU out of memory loading Whisper model.", flush=True)
@@ -539,63 +545,61 @@ def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
                 message=f"Transcribing [{lang_display}]")
     initial_prompt = select_initial_prompt(language)
 
-    seg_iter = None
-    info = None
     segments = []
-    if True:
-        seg_iter, info = model.transcribe(
-            str(wav_path),
-            language=transcribe_language,
-            word_timestamps=True,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=2000),
-            hotwords=hotwords or None,
-            initial_prompt=initial_prompt,
-        )
+    seg_iter, info = model.transcribe(
+        str(wav_path),
+        language=transcribe_language,
+        word_timestamps=True,
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=2000),
+        hotwords=hotwords or None,
+        initial_prompt=initial_prompt,
+    )
 
-        last_progress = -1.0
-        last_progress_emit = 0.0
-        for s in seg_iter:
-            if not s.text.strip():
-                continue
-            segment = {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
-            words = []
-            for word in getattr(s, "words", None) or []:
-                word_text = str(getattr(word, "word", ""))
-                word_start = getattr(word, "start", None)
-                word_end = getattr(word, "end", None)
-                if word_text.strip() and word_start is not None and word_end is not None:
-                    words.append({
-                        "start": round(float(word_start), 2),
-                        "end": round(float(word_end), 2),
-                        "word": word_text,
-                    })
-            if words:
-                segment["words"] = words
-            segments.append(segment)
-            duration = getattr(info, "duration", None)
-            progress = None
-            if duration and duration > 0:
-                progress = min(max(float(s.end) / float(duration), 0.0), 0.99)
-            now = time.monotonic()
-            preview_text = s.text.strip()
-            if (progress is not None and
-                    (progress >= 1.0 or progress - last_progress >= 0.01)) or now - last_progress_emit >= 1.0 or last_progress < 0:
-                _emit_event("progress", stage="transcribing", progress=progress,
-                            segments=len(segments), audio_position_sec=round(float(s.end), 2),
-                            message=f"Transcribed through {format_time(s.end)}",
-                            preview=preview_text)
-                last_progress = progress if progress is not None else last_progress
-                last_progress_emit = now
-            if len(segments) % 20 == 0:
-                print(f"      ... {len(segments)} segments, up to {format_time(s.end)}", flush=True)
+    last_progress = -1.0
+    last_progress_emit = 0.0
+    for s in seg_iter:
+        if not s.text.strip():
+            continue
+        segment = {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
+        words = []
+        for word in getattr(s, "words", None) or []:
+            word_text = str(getattr(word, "word", ""))
+            word_start = getattr(word, "start", None)
+            word_end = getattr(word, "end", None)
+            if word_text.strip() and word_start is not None and word_end is not None:
+                words.append({
+                    "start": round(float(word_start), 2),
+                    "end": round(float(word_end), 2),
+                    "word": word_text,
+                })
+        if words:
+            segment["words"] = words
+        segments.append(segment)
+        duration = getattr(info, "duration", None)
+        progress = None
+        if duration and duration > 0:
+            progress = min(max(float(s.end) / float(duration), 0.0), 0.99)
+        now = time.monotonic()
+        preview_text = s.text.strip()
+        if (progress is not None and
+                (progress >= 1.0 or progress - last_progress >= 0.01)) or now - last_progress_emit >= 1.0 or last_progress < 0:
+            _emit_event("progress", stage="transcribing", progress=progress,
+                        segments=len(segments), audio_position_sec=round(float(s.end), 2),
+                        message=f"Transcribed through {format_time(s.end)}",
+                        preview=preview_text)
+            last_progress = progress if progress is not None else last_progress
+            last_progress_emit = now
+        if len(segments) % 20 == 0:
+            print(f"      ... {len(segments)} segments, up to {format_time(s.end)}", flush=True)
 
-        if segments:
-            _write_stage_cache(whisper_json, "whisper", cache_key or "legacy", segments)
-        print(f"      Done — {len(segments)} segments | detected: {info.language} ({info.language_probability:.0%})", flush=True)
-        _emit_event("stage", stage="transcribing", progress=1.0,
-                    segments=len(segments), message="Whisper transcription completed")
+    if segments:
+        _write_stage_cache(whisper_json, "whisper", cache_key or "legacy", segments,
+                           metadata={"total_sec": getattr(info, "duration", None)})
+    print(f"      Done — {len(segments)} segments | detected: {info.language} ({info.language_probability:.0%})", flush=True)
+    _emit_event("stage", stage="transcribing", progress=1.0,
+                segments=len(segments), message="Whisper transcription completed")
     # NOTE: model release is owned by the pipeline orchestration layer
     # (_run_job_impl) so transcribe-only jobs can reuse Whisper.
     return segments
@@ -606,7 +610,7 @@ def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
 def run_diarization(wav_path: Path, diarize_json: Path, token: str | None = None,
                     num_speakers: int | None = None,
                     max_speakers: int | None = None,
-                    cache_key: str | None = None) -> list[dict]:
+                    cache_key: str | None = None, *, device: str | None = None) -> list[dict]:
     import torch
 
     if cache_key is None:
@@ -631,8 +635,7 @@ def run_diarization(wav_path: Path, diarize_json: Path, token: str | None = None
     _emit_event("stage", stage="loading_diarization", progress=0.0,
                 message="Loading speaker diarization model")
     print(f"[3/4] Loading {DIARIZATION_PIPELINE_ID}...", flush=True)
-    print("      (First run: downloading pyannote models ~500 MB — please wait)", flush=True)
-    device = _resolve_device()
+    device = device or _resolve_device()
     try:
         try:
             pipeline = get_diarize_pipeline(token, device)
@@ -1073,13 +1076,14 @@ def merge_results(whisper_segments: list[dict], speaker_turns: list[dict]) -> li
 
 
 def generate_markdown(segments: list[dict], source_file: str, total_sec: float,
-                      has_diarization: bool, language: str | None) -> str:
+                      has_diarization: bool, language: str | None,
+                      *, title: str = "", model_name: str | None = None) -> str:
     lang_str = language or "auto-detect"
     lines = [
-        "# Transcript", "",
+        f"# {title or 'Transcript'}", "",
         f"**Source**: {source_file}",
         f"**Duration**: {format_time(total_sec)} ({int(total_sec)}s)",
-        f"**Model**: Whisper {config.WHISPER_MODEL}  |  Language: {lang_str}",
+        f"**Model**: Whisper {model_name or config.WHISPER_MODEL}  |  Language: {lang_str}",
         f"**Diarization**: {'pyannote/speaker-diarization-3.1' if has_diarization else 'disabled'}",
         "", "---", "",
     ]
@@ -1139,6 +1143,8 @@ def run_server():
                 os.environ["TRANSCRIBE_JOB_ID"] = job_id
                 try:
                     run_job_from_json(data)
+                except TranscriptionError as e:
+                    _emit_event("failed", stage="worker", message=str(e), error=str(e))
                 except Exception as e:
                     import traceback
                     traceback.print_exc(file=sys.stdout)
@@ -1189,55 +1195,42 @@ def run_job_from_json(data: dict):
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    # Apply settings for this job only. Snapshot the globals first so the
-    # next job falls back to clean defaults instead of this job's values.
-    _saved_settings = (
-        config.WHISPER_MODEL, config.DEVICE, config.MAX_SPEAKERS,
-        config.NUM_SPEAKERS, config.HOTWORDS, config.TRANSCRIPT_DIR,
+    _run_job_impl(
+        input_path, model_name,
+        max_speakers, num_speakers, language,
+        transcribe_only, diarize_only, hotwords, token,
+        output_dir=output_dir, device=device, title=" ".join((data.get("title") or "").split()),
     )
-    config.WHISPER_MODEL = model_name
-    config.DEVICE = device
-    config.MAX_SPEAKERS = max_speakers
-    config.NUM_SPEAKERS = num_speakers
-    config.HOTWORDS = hotwords
-    config.TRANSCRIPT_DIR = output_dir
-    try:
-        _run_job_impl(
-            input_path, model_name,
-            max_speakers, num_speakers, language,
-            transcribe_only, diarize_only, hotwords, token,
-        )
-    finally:
-        (config.WHISPER_MODEL, config.DEVICE, config.MAX_SPEAKERS,
-         config.NUM_SPEAKERS, config.HOTWORDS, config.TRANSCRIPT_DIR) = _saved_settings
 
 
 def _run_job_impl(input_path, model_name,
                   max_speakers, num_speakers, language,
-                  transcribe_only, diarize_only, hotwords, token):
-    if not token:
-        clear_diarize_pipeline()
-
-    paths = derive_paths(input_path)
-    convert_to_wav(input_path, paths["wav"])
-    resolved_device = _resolve_device()
+                  transcribe_only, diarize_only, hotwords, token,
+                  *, output_dir=None, device=None, title=""):
+    paths = derive_paths(input_path, output_dir, title)
+    resolved_device = _resolve_device(device)
     initial_prompt = select_initial_prompt(language)
     whisper_key = _whisper_cache_key(
         model_name, resolved_device, language, hotwords, word_timestamps=True,
         initial_prompt=initial_prompt)
 
-    if diarize_only:
-        # Diarize-only never loads Whisper, only reuses its cache.
-        whisper_segments = _read_stage_cache(paths["whisper_json"], "whisper", whisper_key)
-        if whisper_segments is None:
-            raise FileNotFoundError(f"No cached Whisper result for {input_path.name}")
-    else:
-        # Free the previous task's diarization pipeline before loading Whisper
-        # so both models are never held on GPU at the same time.
+    whisper_payload = _read_stage_payload(paths["whisper_json"], "whisper", whisper_key)
+    whisper_segments = whisper_payload["result"] if whisper_payload is not None else None
+    if diarize_only and whisper_segments is None:
+        raise FileNotFoundError(f"No cached Whisper result for {input_path.name}")
+    speaker_turns = [] if transcribe_only else _read_stage_cache(
+        paths["diarize_json"], "diarization", _diarization_cache_key(max_speakers, num_speakers))
+    if not transcribe_only and not speaker_turns and not token:
+        raise TranscriptionError("Speaker diarization requires a HuggingFace token. "
+                                 "Save one in the dashboard, or explicitly choose Transcribe only.")
+    if whisper_segments is None or (not transcribe_only and not speaker_turns):
+        convert_to_wav(input_path, paths["wav"])
+    if whisper_segments is None:
         clear_diarize_pipeline()
         try:
             whisper_segments = run_whisper(
-                paths["wav"], paths["whisper_json"], language, hotwords, whisper_key)
+                paths["wav"], paths["whisper_json"], language, hotwords, whisper_key,
+                model_name=model_name, device=resolved_device)
         except Exception:
             _release_whisper_before_diarization()
             raise
@@ -1247,26 +1240,21 @@ def _run_job_impl(input_path, model_name,
             _release_whisper_before_diarization()
         raise ValueError("No speech detected in audio")
 
-    if transcribe_only:
-        # Keep Whisper loaded for compatible follow-up tasks.
-        speaker_turns = []
-    else:
-        # Full and diarize-only need pyannote: ensure Whisper is off GPU first.
+    if not transcribe_only and not speaker_turns:
         _release_whisper_before_diarization()
         try:
-            if num_speakers is None:
-                speaker_turns = run_diarization(
-                    paths["wav"], paths["diarize_json"], token, max_speakers=max_speakers)
-            else:
-                speaker_turns = run_diarization(
-                    paths["wav"], paths["diarize_json"], token, num_speakers, max_speakers)
+            speaker_turns = run_diarization(
+                paths["wav"], paths["diarize_json"], token, num_speakers=num_speakers,
+                max_speakers=max_speakers, device=resolved_device)
         except Exception:
             clear_diarize_pipeline()
             raise
 
     segments = merge_results(whisper_segments, speaker_turns)
 
-    total_sec = get_wav_duration(paths["wav"])
+    total_sec = (whisper_payload or {}).get("total_sec") or 0
+    if total_sec <= 0 and paths["wav"].is_file():
+        total_sec = get_wav_duration(paths["wav"])
     if total_sec <= 0 and segments:
         total_sec = segments[-1]["end"]
 
@@ -1279,20 +1267,34 @@ def _run_job_impl(input_path, model_name,
             "total_sec": total_sec,
             "language": language,
             "has_diarization": bool(speaker_turns),
+            "title": title,
         }
         _write_stage_cache(
             segments_path, "merged", merged_key, segments, metadata=metadata)
 
     _emit_event("stage", stage="writing", progress=0.0, message="Writing md output")
     content = generate_markdown(segments, input_path.name, total_sec,
-                                bool(speaker_turns), language)
+                                bool(speaker_turns), language, title=title, model_name=model_name)
     out_path = paths["output_md"]
 
-    out_path.write_text(content, encoding="utf-8")
+    write_markdown(out_path, content)
     print(f"\n✓ Done → {out_path}", flush=True)
     _emit_event("completed", stage="completed", progress=1.0,
                 output_path=str(out_path), diarization=bool(speaker_turns),
                 message="Transcription completed")
+
+
+def write_markdown(path: Path, content: str) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.stem}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def main():
@@ -1334,6 +1336,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
                         help="Comma-separated names or technical terms to bias Whisper")
     parser.add_argument("--output-dir", default=None,
                         help="Directory for output .md file. Overrides config.py TRANSCRIPT_DIR")
+    parser.add_argument("--title", default="", help="Optional transcript title and filename")
     return parser
 
 
@@ -1353,6 +1356,7 @@ def _main():
 
     run_job_from_json({
         "input_path": args.input,
+        "title": args.title,
         "output_dir": args.output_dir or str(config.TRANSCRIPT_DIR),
         "model": args.model or config.WHISPER_MODEL,
         "device": args.device or config.DEVICE,
