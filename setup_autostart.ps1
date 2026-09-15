@@ -1,41 +1,66 @@
-# meeting-transcriber — setup_autostart.ps1
-# Registers watch.py as a Windows Task Scheduler task that starts at login.
+# simple-video-transcriber — setup_autostart.ps1
+# Registers the tray controller in Windows Startup (HKCU Run registry key).
 # Run once with: powershell -ExecutionPolicy Bypass -File setup_autostart.ps1
+
+param(
+    [switch]$Uninstall,
+    [switch]$StartNow
+)
 
 $ErrorActionPreference = "Stop"
 
-$pythonExe = python -c "import sys; print(sys.executable)"
+$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$regName = "SimpleVideoTranscriber"
+
+# 1. Always unregister any legacy Scheduled Task if present
+foreach ($legacyTaskName in @($regName, "MeetingTranscriber-Watcher")) {
+    try {
+        $existingTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "[OK] Cleaned up legacy Windows Scheduled Task '$legacyTaskName'."
+        }
+    } catch {}
+}
+
+if ($Uninstall) {
+    Remove-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue
+    Write-Host "[OK] Autostart registry entry removed. SimpleVideoTranscriber will not start at login."
+    exit 0
+}
+
+# 2. Locate pythonw
+$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$pythonExe = if (Test-Path $venvPython) { $venvPython } else { python -c "import sys; print(sys.executable)" }
 $pythonw   = $pythonExe -replace "python\.exe$", "pythonw.exe"
-$script    = Join-Path $PSScriptRoot "watch.py"
+$script    = Join-Path $PSScriptRoot "tray_app.py"
 
 if (-not (Test-Path $pythonw)) {
-    Write-Warning "pythonw.exe not found at $pythonw — using python.exe (window will appear)"
+    Write-Warning "pythonw.exe not found at $pythonw — using python.exe"
     $pythonw = $pythonExe
 }
 
-$action   = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$script`""
-$trigger  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit 0 `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 2) `
-    -StartWhenAvailable
-
-Register-ScheduledTask `
-    -TaskName    "MeetingTranscriber-Watcher" `
-    -Action      $action `
-    -Trigger     $trigger `
-    -Settings    $settings `
-    -Description "Auto-transcribe new videos dropped into the inbox folder" `
-    -Force | Out-Null
+# 3. Register in HKCU Run key
+$cmd = "`"$pythonw`" `"$script`" --tray-only"
+Set-ItemProperty -Path $regPath -Name $regName -Value $cmd
 
 Write-Host ""
-Write-Host "Task registered: MeetingTranscriber-Watcher"
-Write-Host "The watcher will start automatically on next login."
+Write-Host "==================================================="
+Write-Host " Autostart Registered via Windows Run Key (HKCU)"
+Write-Host "==================================================="
+Write-Host "Command: $cmd"
 Write-Host ""
-Write-Host "Useful commands:"
-Write-Host "  Start now:   Start-ScheduledTask  -TaskName MeetingTranscriber-Watcher"
-Write-Host "  Stop:        Stop-ScheduledTask   -TaskName MeetingTranscriber-Watcher"
-Write-Host "  Disable:     Disable-ScheduledTask -TaskName MeetingTranscriber-Watcher"
-Write-Host "  Uninstall:   Unregister-ScheduledTask -TaskName MeetingTranscriber-Watcher"
-Write-Host "  View log:    Get-Content watch.log -Tail 30"
+Write-Host "[OK] SimpleVideoTranscriber will automatically start when you log in to Windows."
+Write-Host "     (Runs via Explorer desktop session, immune to laptop battery policies)"
+Write-Host ""
+
+if ($StartNow) {
+    Start-Process -FilePath $pythonw -ArgumentList "`"$script`" --tray-only" -WindowStyle Hidden
+    Write-Host "[OK] Launched SimpleVideoTranscriber in the background."
+} else {
+    Write-Host "To launch right now, run:"
+    Write-Host "  Start-Process -FilePath '$pythonw' -ArgumentList '`"$script`" --tray-only' -WindowStyle Hidden"
+}
+Write-Host "To uninstall autostart, run:"
+Write-Host "  powershell -ExecutionPolicy Bypass -File setup_autostart.ps1 -Uninstall"
+Write-Host ""

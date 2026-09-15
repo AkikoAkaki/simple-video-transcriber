@@ -3,13 +3,15 @@ simple-video-transcriber configuration
 All user-facing settings live here. Edit this file to customize behavior.
 """
 from pathlib import Path
+import os
 
 # ── Directories ──────────────────────────────────────────────────────────────
 # Root of this repo (don't change)
 ROOT_DIR = Path(__file__).parent.resolve()
 
-# Drop .mp4 / .m4a / .mov files here — watcher picks them up automatically
-WATCH_DIR = ROOT_DIR / "inbox"
+# OBS recordings are watched by the tray service. Override this on another
+# machine with MEETING_TRANSCRIBER_WATCH_DIR.
+WATCH_DIR = Path(os.environ.get("MEETING_TRANSCRIBER_WATCH_DIR", Path.home() / "Videos"))
 
 # Transcripts are written here as Markdown files
 TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
@@ -17,15 +19,21 @@ TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
 # Intermediate files (16k WAV, JSON caches) — safe to delete any time
 CACHE_DIR = ROOT_DIR / "cache"
 
-# After transcription, move video into a YYYY/ subfolder inside WATCH_DIR
-ORGANIZE_BY_YEAR = True
-
 # ── Whisper ───────────────────────────────────────────────────────────────────
 # Model size vs. quality trade-off:
-#   tiny / base / small  → fast, weaker accuracy
-#   medium               → good balance for English
-#   large-v2 / large-v3  → best quality, needs ~6 GB VRAM (recommended)
-WHISPER_MODEL = "large-v3"
+#   large-v3-turbo       → fast, high accuracy (~1.6 GB, recommended)
+#   large-v3             → best quality, needs ~6 GB VRAM
+WHISPER_MODEL = "large-v3-turbo"
+
+# Single source of truth for supported Whisper models.
+SUPPORTED_MODELS = ("large-v3-turbo", "large-v3")
+
+
+def normalize_whisper_model(value) -> str:
+    """Map legacy/unsupported model names to the default supported model."""
+    if isinstance(value, str) and value in SUPPORTED_MODELS:
+        return value
+    return WHISPER_MODEL
 
 # Transcription language:
 #   None  → auto-detect (recommended for mixed-language audio)
@@ -53,13 +61,19 @@ HF_TOKEN = ""
 # None = auto-detect.
 MAX_SPEAKERS = None
 
-# ── Watcher ──────────────────────────────────────────────────────────────────
-# Seconds a file's size must be unchanged before transcription starts.
-# Increase if you're copying large files over a slow network.
-STABLE_SECONDS = 10
+# Exact speaker count, when known for a recording.  Leave unset to let
+# pyannote estimate the number of speakers automatically.
+NUM_SPEAKERS = None
 
+# Optional comma-separated names and technical terms passed to Whisper.
+HOTWORDS = ""
+
+# ── Watcher ──────────────────────────────────────────────────────────────────
 # Files smaller than this are ignored (filters out accidental tiny files).
 MIN_FILE_SIZE_KB = 100
 
 # Supported video/audio extensions the watcher will pick up.
-WATCH_EXTENSIONS = {".mp4", ".m4a", ".mov", ".mkv", ".webm", ".mp3", ".wav"}
+WATCH_EXTENSIONS = {
+    ".mp4", ".m4a", ".mov", ".mkv", ".webm", ".mp3", ".wav",
+    ".ts", ".flac", ".aac", ".opus",
+}

@@ -1,180 +1,56 @@
-# Simple Video Transcriber
+# Meeting Transcriber
 
-> Transcribe any video or audio with speaker labels — fully local, no data ever leaves your machine.
-
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)]()
+A personal Windows tool that turns OBS meeting recordings, iPhone Voice Memos, and other audio/video into Markdown with timestamps and speaker labels. Transcripts are kept for reference and agent context. Recognition runs locally; initial model downloads require internet access. The tool does not summarize, rewrite, or infer speaker names.
 
 [中文说明](README.zh.md)
 
-<img width="1254" height="1254" alt="3de7748e736e3185d5a6b84ef6016c1c" src="https://github.com/user-attachments/assets/65ba0a6a-045f-4cb1-bf2e-9b14b5a08e3f" />
+## Use
 
+- **Manual files:** run `start.bat` or click the tray icon, select or drop one or more files in the dashboard, and click **Transcribe**. Files run sequentially with the same language, speaker-count, and terminology settings for the batch.
+- **OBS recordings:** select the recording folder and enable **Watch in background**. The watcher handles new files appearing while it is running, not an existing archive. Disable it when unnecessary.
+- **Agents / CLI:** call `transcribe.py`. It uses the same pipeline as the dashboard. Success exits with code 0; failure exits with a nonzero code.
 
----
+**Title** is optional and sets the Markdown heading and filename. For a batch it prefixes each source filename. Output names retain source fingerprints to distinguish replaced files such as repeated `New Recording 4` recordings. CLI: `--title "CSC290 Lecture 3"`.
 
-## What it does
+Double-click a recent task or click **Open result** to open its Markdown. **Retry** requeues a failed or cancelled task with its original settings and the current token. The source recording must still exist and match the original file version; import a replaced recording as a new task. Transcripts moved into Obsidian are not tracked or automatically recreated.
 
-Drop any video or audio file onto the app — meetings, lectures, interviews, podcasts. Get back a transcript with speaker labels, timestamps, and your choice of output format — all processed locally using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) and [pyannote.audio](https://github.com/pyannote/pyannote-audio).
+**Full pipeline** includes speaker diarization. Save a HuggingFace token in the dashboard and accept the terms for [speaker-diarization-3.1](https://hf.co/pyannote/speaker-diarization-3.1) and [segmentation-3.0](https://hf.co/pyannote/segmentation-3.0). Without a token or valid diarization cache, or if loading or diarization fails or returns no speaker turns, the task fails and does not publish a new Markdown transcript.
 
-```
-### [00:00:00 – 00:00:16] SPEAKER_00
-Let's first look at what you've been working on.
+Choose **Transcribe only** explicitly for recordings known to contain one speaker when labels are unnecessary. Use **Full pipeline** for lectures with student interaction, seminars, and meetings. Leave speaker counts automatic unless known; **Exact speakers** takes precedence over **Max speakers**. **Names / terms** provides recognition hints, not verified speaker identities.
 
-### [00:00:16 – 00:01:10] SPEAKER_01
-Can you see my screen? So I ran the layout experiment...
-```
+## Install and start
 
-Output formats: **Markdown** (`.md`), **SRT subtitles** (`.srt`), or **plain text** (`.txt`).
+Requires Windows, Python 3.10+, and ffmpeg. `install.bat` checks Python, attempts to install missing ffmpeg through winget, and installs `requirements.txt` into `.venv`. Then run `start.bat`.
 
----
+To start the tray at login:
 
-## Features
-
-- **Speaker diarization** — labels each segment with a speaker ID
-- **Three output formats** — Markdown for notes, SRT for video editing, plain text for LLMs
-- **Flexible pipeline** — run full pipeline, transcription only, or re-diarize existing output
-- **Offline** — all models run locally; no API key, no cloud service
-- **GPU-accelerated** — uses CUDA if available, falls back to CPU automatically
-- **Auto-watcher** — drop files into `inbox/` and transcriptions run unattended
-- **Cross-platform** — Windows and macOS, with one-click install scripts
-
----
-
-## Install
-
-### Windows
-
-1. [Download the zip](https://github.com/AkikoAkaki/simple-video-transcriber/releases) and extract it
-2. Double-click `install.bat`
-3. Double-click `start.bat`
-
-### macOS
-
-1. [Download the zip](https://github.com/AkikoAkaki/simple-video-transcriber/releases) and extract it
-2. Double-click `install.command` — enter your password if prompted (for Homebrew)
-3. Double-click `start.command`
-
-> **GPU acceleration (optional):** The default install uses CPU-only PyTorch. After installing, replace it with your CUDA version from [pytorch.org](https://pytorch.org/get-started/locally/).
-
----
-
-## Quick start
-
-1. On first launch, an onboarding panel guides you through getting a free [HuggingFace token](https://huggingface.co/settings/tokens) — takes about 2 minutes, one time only
-2. Drag a file onto the drop zone (or click **Browse…**)
-3. Choose your output format and pipeline mode
-4. Click **Transcribe**
-5. Click **Open transcript →** when done
-
-The HuggingFace token is required only for speaker diarization. If you skip it, transcription still works — you just won't get speaker labels.
-
----
-
-## Performance
-
-Measured on RTX 4060 (8 GB VRAM), 25-minute video, `large-v3` model:
-
-| Step | Time |
-|------|------|
-| Audio extraction | ~10 s |
-| Whisper transcription | ~8 min |
-| Speaker diarization | ~12 min |
-
-On CPU-only hardware, expect 5–10× longer. Switch to `medium` or `small` in Settings to trade accuracy for speed.
-
----
-
-## FAQ
-
-**Do I need a GPU?**
-No. CPU works out of the box, just slower. The app shows a note in the status bar if no GPU is detected.
-
-**Which Whisper model should I use?**
-`large-v3` gives the best accuracy and is the default. For weaker hardware, `medium` is a good balance. `small` and `base` are faster but noticeably less accurate.
-
-**The detected language is wrong.**
-Pick your language from the dropdown in Settings (Auto / English / 中文 / 日本語 / …).
-
-**I get no speaker labels in the output.**
-You need a HuggingFace token with the pyannote model licenses accepted. The onboarding panel walks you through this step by step.
-
-**Can I re-run just the diarization without re-transcribing?**
-Yes — select **Re-diarize only** in the Pipeline dropdown. Whisper output is cached and reused.
-
----
-
-## Requirements
-
-- Windows 10+ or macOS 12+
-- Python 3.10+ (installed automatically by the install script)
-- ffmpeg (installed automatically by the install script)
-
----
-
-<details>
-<summary>Advanced: CLI usage</summary>
-
-```bash
-# Basic transcription
-python transcribe.py path/to/meeting.mp4
-
-# Force a specific language
-python transcribe.py meeting.mp4 --language zh
-
-# Skip diarization (no token needed)
-python transcribe.py meeting.mp4 --mode transcribe-only
-
-# Re-run diarization on existing cached Whisper output
-python transcribe.py meeting.mp4 --mode diarize-only
-
-# Choose output format
-python transcribe.py meeting.mp4 --output-format srt
-python transcribe.py meeting.mp4 --output-format txt
-
-# Override model, device, speaker count, or output location
-python transcribe.py meeting.mp4 --model medium --device cpu --max-speakers 3 --output-dir ./my-transcripts
+```powershell
+powershell -ExecutionPolicy Bypass -File setup_autostart.ps1
 ```
 
-</details>
+Append `-Uninstall` to remove autostart. This script manages autostart; `config.py` does not.
 
-<details>
-<summary>Advanced: Auto-watcher</summary>
+## Command line
 
-The watcher monitors `inbox/` and transcribes new files automatically.
+Use the Python environment containing the dependencies, such as `.venv\Scripts\python.exe` after running the installer:
 
-```bash
-python watch.py            # start watching
-python watch.py --dry-run  # detect files but don't transcribe
+```powershell
+python transcribe.py "lecture.m4a" --language en
+python transcribe.py "meeting.mp4" --num-speakers 3 --hotwords "vLLM,KV Cache"
+python transcribe.py "solo-lecture.m4a" --transcribe-only
+python transcribe.py "meeting.mp4" --diarize-only
 ```
 
-Files are transcribed once their size has been stable for 10 seconds (configurable). After a successful transcription, videos can optionally be moved into a `YYYY/` subfolder (see `ORGANIZE_BY_YEAR` in `config.py`).
+`--diarize-only` reuses Whisper results matching the current recognition settings; matching diarization results are also reused. Keep recognition caches when retrying failures. Overrides include `--model large-v3`, `--device cpu`, `--max-speakers 3`, and `--output-dir ./transcripts`. CLI token sources include the dashboard store, the `HF_TOKEN` environment variable, and `config.py`.
 
-</details>
+## Files and settings
 
-<details>
-<summary>Advanced: Configuration reference</summary>
+- `transcripts/`: a staging folder for results you can rename and archive in Obsidian. Markdown is fully written before replacing the destination; write failures preserve the existing file. Archives are not automatically moved or deleted.
+- `cache/`: intermediate audio and recognition, diarization, and merged results. **Clear Audio Cache** removes only audio associated with terminal jobs, preserving JSON and Markdown.
+- `%LOCALAPPDATA%/SimpleVideoTranscriber/`: dashboard settings, the job database, and text logs. Existing historical event tables remain intact but receive no new events.
 
-Edit `config.py` to change defaults:
+`config.py` supplies defaults. The tray uses settings saved by the dashboard; CLI arguments override the corresponding defaults. The default model is `large-v3-turbo`, with `large-v3` also available; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed in the dashboard or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `WATCH_DIR` | `inbox/` | Folder the watcher monitors |
-| `TRANSCRIPT_DIR` | `transcripts/` | Output folder |
-| `CACHE_DIR` | `cache/` | Intermediate files — safe to delete any time |
-| `WHISPER_MODEL` | `large-v3` | Model size: `tiny` / `base` / `small` / `medium` / `large-v3` |
-| `LANGUAGE` | `None` | `"en"` / `"zh"` / `"ja"` / … — `None` = auto-detect |
-| `DEVICE` | `"auto"` | `"cuda"` / `"cpu"` / `"auto"` |
-| `MAX_SPEAKERS` | `None` | Set an integer if you know the speaker count |
-| `ORGANIZE_BY_YEAR` | `True` | Move processed videos into `YYYY/` subfolders |
-| `STABLE_SECONDS` | `10` | Seconds a file must be unchanged before transcription starts |
-| `MIN_FILE_SIZE_KB` | `100` | Ignore files smaller than this |
-| `WATCH_EXTENSIONS` | `{".mp4", …}` | File types the watcher picks up |
+Transcription settings are captured when a task is queued. Missing tokens fail early unless a valid diarization cache exists. Matching recognition and diarization caches bypass audio extraction and model execution.
 
-</details>
-
----
-
-## License
-
-MIT
+The watcher waits for roughly 15 seconds of stable file size and checks whether the file can be opened. This is a recording-completion heuristic; paused recordings or transfers can trigger early. Source audio/video is neither moved nor deleted, and media links are not added automatically.
