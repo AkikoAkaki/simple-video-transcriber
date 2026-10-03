@@ -583,8 +583,7 @@ def run_whisper(wav_path: Path, whisper_json: Path, language: str | None,
             progress = min(max(float(s.end) / float(duration), 0.0), 0.99)
         now = time.monotonic()
         preview_text = s.text.strip()
-        if (progress is not None and
-                (progress >= 1.0 or progress - last_progress >= 0.01)) or now - last_progress_emit >= 1.0 or last_progress < 0:
+        if (progress is not None and progress - last_progress >= 0.01) or now - last_progress_emit >= 1.0 or last_progress < 0:
             _emit_event("progress", stage="transcribing", progress=progress,
                         segments=len(segments), audio_position_sec=round(float(s.end), 2),
                         message=f"Transcribed through {format_time(s.end)}",
@@ -929,11 +928,6 @@ def _join_display_text(current: str, addition: str) -> str:
     return current + addition
 
 
-def _join_whisper_segment_text(current: str, addition: str) -> str:
-    """Separate adjacent Whisper segments following CJK and Western typography rules."""
-    return _join_display_text(current, addition)
-
-
 def _coalesce_short_speaker_runs(segments: list[dict], max_duration: float = 1.0) -> list[dict]:
     """Suppress only high-confidence, short diarization flicker.
 
@@ -1003,7 +997,7 @@ def _merge_word_timestamps(whisper_segments: list[dict], speaker_turns: list[dic
             if merged[-1]["_source_segment"] == word["segment_index"]:
                 merged[-1]["text"] = _append_word_text(merged[-1]["text"], word["word"])
             else:
-                merged[-1]["text"] = _join_whisper_segment_text(
+                merged[-1]["text"] = _join_display_text(
                     merged[-1]["text"], word["word"])
                 merged[-1]["_source_segment"] = word["segment_index"]
         else:
@@ -1258,19 +1252,17 @@ def _run_job_impl(input_path, model_name,
     if total_sec <= 0 and segments:
         total_sec = segments[-1]["end"]
 
-    segments_path = paths.get("segments_json")
     merged_key = _merged_cache_key(
         whisper_key, max_speakers, num_speakers, bool(speaker_turns))
-    if segments_path:
-        metadata = {
-            "source_file": input_path.name,
-            "total_sec": total_sec,
-            "language": language,
-            "has_diarization": bool(speaker_turns),
-            "title": title,
-        }
-        _write_stage_cache(
-            segments_path, "merged", merged_key, segments, metadata=metadata)
+    metadata = {
+        "source_file": input_path.name,
+        "total_sec": total_sec,
+        "language": language,
+        "has_diarization": bool(speaker_turns),
+        "title": title,
+    }
+    _write_stage_cache(
+        paths["segments_json"], "merged", merged_key, segments, metadata=metadata)
 
     _emit_event("stage", stage="writing", progress=0.0, message="Writing md output")
     content = generate_markdown(segments, input_path.name, total_sec,

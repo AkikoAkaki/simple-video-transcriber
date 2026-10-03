@@ -45,7 +45,6 @@ def format_size(num_bytes: int | float | None) -> str:
                 return f"{int(size)} B"
             return f"{size:.1f} {unit}"
         size /= 1024.0
-    return f"{size:.1f} PB"
 
 
 

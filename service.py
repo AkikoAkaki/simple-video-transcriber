@@ -366,7 +366,7 @@ class JobStore:
         resolved = str(path.resolve())
         return resolved, stat.st_size, stat.st_mtime_ns, f"{resolved}|{stat.st_size}|{stat.st_mtime_ns}"
 
-    def create_if_new(self, path: Path, options: dict = None) -> dict | None:
+    def create_if_new(self, path: Path, options: dict = None, *, from_watcher: bool = False) -> dict | None:
         try:
             resolved, size, mtime, key = self.source_key(path)
         except OSError:
@@ -378,6 +378,12 @@ class JobStore:
             if existing:
                 existing = dict(existing)
                 if existing["status"] in {"queued", "running", "converting", "transcribing", "diarizing", "cancel_requested"}:
+                    return None
+                if from_watcher:
+                    # Automatic redetection must never resurrect a finished job.
+                    # A stray filesystem event for an unchanged recording would
+                    # otherwise re-queue hours of GPU work and wipe the result
+                    # pointer. Intentional re-runs go through retry_job / manual add.
                     return None
                 job_id = existing["job_id"]
                 conn.execute(
@@ -484,7 +490,7 @@ class JobStore:
         return cur.rowcount
 
 
-def _is_supported(path: Path, settings: AppSettings) -> bool:
+def _is_supported(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in config.WATCH_EXTENSIONS
 
 
@@ -543,7 +549,7 @@ class FileWatcher:
     def _start_existing(self, root: Path) -> None:
         self._resolved_watch_dir = root.resolve()
         # Baseline existing files.  A first launch must not process an archive.
-        self._known = {str(p.resolve()) for p in root.iterdir() if _is_supported(p, self.settings)}
+        self._known = {str(p.resolve()) for p in root.iterdir() if _is_supported(p)}
         self._observer = Observer()
         self._observer.schedule(_WatchHandler(self), str(root), recursive=False)
         self._observer.start()
@@ -574,7 +580,7 @@ class FileWatcher:
             path = path.resolve()
             if path.parent != self._resolved_watch_dir:
                 return
-            if not _is_supported(path, self.settings):
+            if not _is_supported(path):
                 return
             stat = path.stat()
         except OSError:
@@ -584,7 +590,7 @@ class FileWatcher:
             old = self._pending.get(key)
             if old is None:
                 self._pending[key] = (stat.st_size, time.time())
-                self.on_event("detected", {"path": str(path), "size": stat.st_size})
+                self.on_event("detected", {"path": str(path), "size": stat.st_size, "message": f"Detected {path.name}"})
             elif old[0] != stat.st_size:
                 self._pending[key] = (stat.st_size, time.time())
 
@@ -613,7 +619,7 @@ class FileWatcher:
             min_bytes = 0
         for entry in entries:
             try:
-                if not _is_supported(entry, self.settings):
+                if not _is_supported(entry):
                     continue
                 key = str(entry.resolve())
             except OSError:
@@ -680,7 +686,7 @@ class FileWatcher:
             if current >= self.settings.min_file_size_kb * 1024:
                 self._known.add(key)
                 ready.append(path)
-                self.on_event("ready", {"path": str(path), "size": current})
+                self.on_event("ready", {"path": str(path), "size": current, "message": f"Ready {path.name}"})
             else:
                 self.on_event("ignored", {"path": str(path), "message": "File is below minimum size"})
         return ready
@@ -709,7 +715,6 @@ class WorkerController:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self._active: dict | None = None
-        self._last_progress: dict[str, tuple[float, float]] = {}
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="transcription-worker", daemon=True)
         self._thread.start()
@@ -722,7 +727,6 @@ class WorkerController:
     def enqueue(self, row: dict) -> None:
         with self._lock:
             self._queue.append(row)
-            self._last_progress.pop(row["job_id"], None)
         self._emit(row["job_id"], "queued", {"message": "Queued"})
 
     def stop(self) -> None:
@@ -1014,8 +1018,6 @@ class WorkerController:
         event["job_id"] = job_id
         kind = event.get("event", "log")
 
-        if kind == "progress" and not self._should_forward_progress(job_id, event):
-            return
         stage = event.get("stage", "")
         changes = {"stage": stage or kind, "message": event.get("message", kind)}
         if isinstance(event.get("progress"), (int, float)):
@@ -1044,27 +1046,6 @@ class WorkerController:
                     self._active.pop("preview", None)
             return
         self.on_event(kind, event)
-
-    def _should_forward_progress(self, job_id: str, event: dict) -> bool:
-        """Keep live UI updates responsive without persisting every segment."""
-        progress = event.get("progress")
-        now = time.monotonic()
-        if "preview" in event:
-            self._last_progress[job_id] = (
-                float(progress) if isinstance(progress, (int, float)) else -1.0,
-                now,
-            )
-            return True
-        previous = self._last_progress.get(job_id)
-        if previous is None:
-            self._last_progress[job_id] = (float(progress) if isinstance(progress, (int, float)) else -1.0, now)
-            return True
-        last_value, last_time = previous
-        value = float(progress) if isinstance(progress, (int, float)) else last_value
-        if value >= 1.0 or value - last_value >= 0.01 or now - last_time >= 1.0:
-            self._last_progress[job_id] = (value, now)
-            return True
-        return False
 
 
 class BackgroundService:
@@ -1122,11 +1103,11 @@ class BackgroundService:
         """Manually reconcile the watch directory (picks up missed files now)."""
         self.watcher.rescan()
 
-    def add_file(self, path: Path, options: dict = None) -> dict | None:
+    def add_file(self, path: Path, options: dict = None, *, from_watcher: bool = False) -> dict | None:
         options = dict(options or {})
         for name in ("model", "device", "language", "max_speakers", "num_speakers", "hotwords"):
             options.setdefault(name, getattr(self.settings, name))
-        row = self.store.create_if_new(path, options)
+        row = self.store.create_if_new(path, options, from_watcher=from_watcher)
         if row:
             self.worker.enqueue(row)
         return row
@@ -1153,7 +1134,7 @@ class BackgroundService:
     def _event(self, event: str, payload: dict) -> None:
         if event == "ready":
             path = Path(payload["path"])
-            row = self.add_file(path)
+            row = self.add_file(path, from_watcher=True)
             if row:
                 payload = {**payload, "job_id": row["job_id"], "message": "Added to queue"}
             else:
