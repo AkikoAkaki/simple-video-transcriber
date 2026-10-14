@@ -49,6 +49,8 @@ python transcribe.py "meeting.mp4" --diarize-only
 - `cache/`：音频中间文件和识别、分离、合并结果。**Clear Audio Cache** 只清理与已结束任务关联的音频缓存，保留 JSON 和 Markdown。
 - `%LOCALAPPDATA%/SimpleVideoTranscriber/`：dashboard 设置、任务数据库和文本日志。已有历史事件表保留，但不再写入新事件。
 
+CLI 与 dashboard 不能同时处理同一版本的录音。其他任务正在使用它时，转录会报音频缓存被占用，等该任务结束后再重试。**Clear Audio Cache** 会跳过占用中的 WAV。
+
 `config.py` 提供默认设置；dashboard 保存的设置供托盘使用，命令行参数覆盖对应默认值。默认模型为 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在 dashboard 修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
 
 任务入队时保存转录设置。缺少 Token 且没有可用分离缓存时提前失败；识别和分离缓存均匹配时，跳过音频提取和模型运行。

@@ -49,6 +49,8 @@ python transcribe.py "meeting.mp4" --diarize-only
 - `cache/`: intermediate audio and recognition, diarization, and merged results. **Clear Audio Cache** removes only audio associated with terminal jobs, preserving JSON and Markdown.
 - `%LOCALAPPDATA%/SimpleVideoTranscriber/`: dashboard settings, the job database, and text logs. Existing historical event tables remain intact but receive no new events.
 
+CLI and dashboard tasks cannot process the same recording version concurrently. If another task is using it, transcription fails with an audio-cache-in-use error; retry after that task finishes. **Clear Audio Cache** skips WAVs in use.
+
 `config.py` supplies defaults. The tray uses settings saved by the dashboard; CLI arguments override the corresponding defaults. The default model is `large-v3-turbo`, with `large-v3` also available; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed in the dashboard or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
 
 Transcription settings are captured when a task is queued. Missing tokens fail early unless a valid diarization cache exists. Matching recognition and diarization caches bypass audio extraction and model execution.

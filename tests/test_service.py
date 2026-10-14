@@ -203,7 +203,7 @@ def test_audio_cleanup_preserves_all_unowned_and_active_files(svc, tmp_path):
         (cache / name).write_bytes(b"must survive")
     before = {p.name: p.read_bytes() for p in cache.iterdir()}
     result = svc.clear_audio_cache()
-    after = {p.name: p.read_bytes() for p in cache.iterdir()}
+    after = {name: (cache / name).read_bytes() for name in before if (cache / name).exists()}
     assert after == {name: data for name, data in before.items() if name not in removable}
     assert result["deleted_count"] == len(removable)
 

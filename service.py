@@ -21,12 +21,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 from collections import deque
+from contextlib import suppress
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 import config
-from paths import transcript_path, format_size, get_cache_size_bytes
+from paths import transcript_path, format_size, get_cache_size_bytes, audio_cache_lock
 
 
 APP_DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".local")) / "SimpleVideoTranscriber"
@@ -195,10 +196,11 @@ def clear_audio_cache(
             continue
 
         try:
-            size = item.stat().st_size
-            item.unlink()
-            deleted_count += 1
-            reclaimed_bytes += size
+            with audio_cache_lock(cache_path / f"{base}.wav"):
+                size = item.stat().st_size
+                item.unlink()
+                deleted_count += 1
+                reclaimed_bytes += size
         except OSError:
             pass
 
@@ -535,7 +537,11 @@ class FileWatcher:
 
     def start(self) -> None:
         root = _safe_path(self.settings.watch_dir)
-        self._resolved_watch_dir = root.resolve()
+        with self._lock:
+            if root != self._resolved_watch_dir:
+                self._pending.clear()
+                self._known.clear()
+            self._resolved_watch_dir = root
         if not root.exists():
             self.on_event("watch_error", {"message": f"Watch folder unavailable: {root}"})
             self._stop.clear()
@@ -590,9 +596,10 @@ class FileWatcher:
             old = self._pending.get(key)
             if old is None:
                 self._pending[key] = (stat.st_size, time.time())
-                self.on_event("detected", {"path": str(path), "size": stat.st_size, "message": f"Detected {path.name}"})
             elif old[0] != stat.st_size:
                 self._pending[key] = (stat.st_size, time.time())
+        if old is None:
+            self.on_event("detected", {"path": str(path), "size": stat.st_size, "message": f"Detected {path.name}"})
 
     def rescan(self) -> None:
         """Reconcile the watch directory against known/pending state.
@@ -684,22 +691,28 @@ class FileWatcher:
             with self._lock:
                 self._pending.pop(key, None)
             if current >= self.settings.min_file_size_kb * 1024:
-                self._known.add(key)
+                try:
+                    self.on_event("ready", {"path": str(path), "size": current, "message": f"Ready {path.name}"})
+                except Exception:
+                    with self._lock:
+                        self._pending[key] = (current, now)
+                    raise
+                with self._lock:
+                    self._known.add(key)
                 ready.append(path)
-                self.on_event("ready", {"path": str(path), "size": current, "message": f"Ready {path.name}"})
             else:
                 self.on_event("ignored", {"path": str(path), "message": "File is below minimum size"})
         return ready
 
     def _tick_loop(self) -> None:
         while not self._stop.wait(2.0):
-            self.tick_once()
-            if time.monotonic() - self._last_rescan >= self.RESCAN_INTERVAL_SECONDS:
-                self._last_rescan = time.monotonic()
-                try:
+            try:
+                self.tick_once()
+                if time.monotonic() - self._last_rescan >= self.RESCAN_INTERVAL_SECONDS:
+                    self._last_rescan = time.monotonic()
                     self.rescan()
-                except Exception as exc:
-                    self.on_event("log", {"message": f"Directory rescan failed: {exc}"})
+            except Exception as exc:
+                self.on_event("watch_error", {"message": f"Directory scan failed: {exc}"})
 
 
 class WorkerController:
@@ -750,27 +763,28 @@ class WorkerController:
     def _request_cancel(self, message: str) -> dict | None:
         with self._lock:
             row = self._active
-        if not row:
-            return None
-        changed = self.store.update_if_status(
-            row["job_id"], ACTIVE_STATUSES,
-            status="cancel_requested", stage="cancelling", message=message,
-        )
-        if changed:
-            self._emit(row["job_id"], "cancel_requested", {"message": message})
-        with self._lock:
+            if not row:
+                return None
+            changed = self.store.update_if_status(
+                row["job_id"], ACTIVE_STATUSES,
+                status="cancel_requested", stage="cancelling", message=message,
+            )
+            if not changed:
+                return None
             proc = self._proc
             self._proc = None
         if proc:
             _terminate_process_tree(proc)
+        self._emit(row["job_id"], "cancel_requested", {"message": message})
         return row
 
     def _finalize_cancelled(self, job_id: str, message: str = "Cancelled") -> None:
-        current = self.store.get(job_id)
-        if not current or current.get("status") == "cancelled":
-            return
-        self.store.update(job_id, status="cancelled", stage="cancelled", message=message, finished_at=_now())
-        self._emit(job_id, "cancelled", {"stage": "cancelled", "message": message})
+        changed = self.store.update_if_status(
+            job_id, {"running", "cancel_requested"}, status="cancelled", stage="cancelled",
+            message=message, finished_at=_now(),
+        )
+        if changed:
+            self._emit(job_id, "cancelled", {"stage": "cancelled", "message": message})
 
     def _emit(self, job_id: str, event: str, payload: dict) -> None:
         payload = {"job_id": job_id, "event": event, **payload}
@@ -784,14 +798,33 @@ class WorkerController:
                     row = self._queue.popleft()
                     self._active = row
             if row:
-                self._run_one_server(row)
-                with self._lock:
-                    self._active = None
+                try:
+                    self._run_one_server(row)
+                except Exception as exc:
+                    try:
+                        changed = self.store.update_if_status(
+                            row["job_id"], ACTIVE_STATUSES, status="failed", stage="failed",
+                            message=str(exc), error=str(exc), finished_at=_now(),
+                        )
+                    except sqlite3.Error as store_exc:
+                        self._emit(row["job_id"], "log", {"message": f"Could not save task failure: {store_exc}; {exc}"})
+                    else:
+                        if not changed:
+                            self._finalize_cancelled(row["job_id"])
+                        else:
+                            self._emit(row["job_id"], "failed", {"message": str(exc), "error": str(exc)})
+                finally:
+                    with self._lock:
+                        self._active = None
                 continue
             self._stop.wait(0.5)
 
     def _ensure_server_running(self) -> subprocess.Popen:
         with self._lock:
+            if self._active:
+                current = self.store.get(self._active["job_id"])
+                if current and current["status"] in {"cancel_requested", "cancelled"}:
+                    raise RuntimeError("Task cancelled before worker startup")
             if self._proc is not None and self._proc.poll() is None:
                 return self._proc
 
@@ -859,6 +892,8 @@ class WorkerController:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         job_db = self.store.get(job_id) or row
+        if self.store.source_key(source)[3] != job_db["source_key"]:
+            raise ValueError("The recording at this path has changed. Import it as a new task.")
         options = {}
         if job_db.get("options_json"):
             try:
@@ -898,6 +933,7 @@ class WorkerController:
                 "command": "transcribe",
                 "job_id": job_id,
                 "input_path": str(source),
+                "source_fingerprint": hashlib.sha256(job_db["source_key"].encode("utf-8")).hexdigest()[:12],
                 "output_dir": str(out_dir),
                 "model": options.get("model", self.settings.model),
                 "device": options.get("device", self.settings.device),
@@ -912,8 +948,18 @@ class WorkerController:
             }
 
             assert proc.stdin is not None
-            proc.stdin.write(json.dumps(task) + "\n")
-            proc.stdin.flush()
+            with self._lock:
+                current = self.store.get(job_id)
+                dispatch = current is not None and current["status"] == "running"
+                if dispatch:
+                    proc.stdin.write(json.dumps(task) + "\n")
+                    proc.stdin.flush()
+                elif self._proc is proc:
+                    self._proc = None
+            if not dispatch:
+                _terminate_process_tree(proc)
+                self._finalize_cancelled(job_id)
+                return
 
             assert proc.stdout is not None
             for raw in proc.stdout:
@@ -983,8 +1029,11 @@ class WorkerController:
                 output = latest.get("output_path") or str(transcript_path(source, out_dir))
             except OSError as exc:
                 message = f"Could not resolve expected output path: {exc}"
-                self.store.update(job_id, status="failed", stage="failed", message=message,
-                                  error=message, finished_at=_now())
+                changed = self.store.update_if_status(job_id, {"running"}, status="failed", stage="failed", message=message,
+                                                     error=message, finished_at=_now())
+                if not changed:
+                    self._finalize_cancelled(job_id)
+                    return
                 self._emit(job_id, "failed", {"stage": "failed", "message": message, "error": message})
                 return
             output_file = Path(output)
@@ -994,23 +1043,32 @@ class WorkerController:
                 output_ok = False
             if not output_ok:
                 message = f"Worker exited successfully but output file is missing or empty: {output}"
-                self.store.update(job_id, status="failed", stage="failed", message=message,
-                                  error=message, finished_at=_now())
+                changed = self.store.update_if_status(job_id, {"running"}, status="failed", stage="failed", message=message,
+                                                     error=message, finished_at=_now())
+                if not changed:
+                    self._finalize_cancelled(job_id)
+                    return
                 self._emit(job_id, "failed", {"stage": "failed", "message": message, "error": message})
                 return
             had_warning = terminal_kind == "completed_with_warning" or latest.get("status") == "completed_with_warning" or bool(latest.get("error"))
             final_status = "completed_with_warning" if had_warning else "completed"
             final_message = "Completed with warnings" if had_warning else "Completed"
-            self.store.update(job_id, status=final_status, stage="completed", progress=1.0,
-                              message=final_message, output_path=output, finished_at=_now())
+            changed = self.store.update_if_status(job_id, {"running"}, status=final_status, stage="completed", progress=1.0,
+                                                 message=final_message, output_path=output, finished_at=_now())
+            if not changed:
+                self._finalize_cancelled(job_id)
+                return
             self._emit(job_id, final_status,
                        {"stage": "completed", "progress": 1.0,
                         "message": final_message, "output_path": output,
                         "error": latest.get("error", "")})
         else:
             message = latest.get("error") or f"Worker exited with code {return_code}"
-            self.store.update(job_id, status="failed", stage="failed", message=message,
-                              error=message, finished_at=_now())
+            changed = self.store.update_if_status(job_id, {"running"}, status="failed", stage="failed", message=message,
+                                                 error=message, finished_at=_now())
+            if not changed:
+                self._finalize_cancelled(job_id)
+                return
             self._emit(job_id, "failed", {"stage": "failed", "message": message, "error": message})
 
     def _apply_worker_event(self, job_id: str, event: dict) -> None:
@@ -1151,7 +1209,7 @@ class BackgroundService:
             message = message.replace(token, "[redacted]")
         job_id = payload.get("job_id")
         line = f"{timestamp} [{event}] {message}\n"
-        with self._log_lock:
+        with self._log_lock, suppress(OSError):
             self._log_count += 1
             app_log = LOG_DIR / "app.log"
             if self._log_count % 100 == 0:

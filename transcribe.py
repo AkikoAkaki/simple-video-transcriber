@@ -7,9 +7,9 @@ Usage:
   python transcribe.py <video>                    # full pipeline
   python transcribe.py <video> --language en      # force language
   python transcribe.py <video> --transcribe-only  # skip diarization
-  python transcribe.py <video> --diarize-only     # re-run diarization only
+  python transcribe.py <video> --diarize-only     # reuse matching stage caches
 
-Output: transcripts/<filename>.md
+Output: transcripts/<filename>_<source-fingerprint>.md
 """
 
 import json
@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", message=r".*std\(\).*degrees of freedom.*")
 warnings.filterwarnings("ignore", message=".*resume_download.*")
 
 import config
-from paths import source_fingerprint, transcript_path
+from paths import source_fingerprint, transcript_path, audio_cache_lock
 
 
 CACHE_SCHEMA_VERSION = 2
@@ -1189,12 +1189,20 @@ def run_job_from_json(data: dict):
     if not input_path.is_file():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    _run_job_impl(
-        input_path, model_name,
-        max_speakers, num_speakers, language,
-        transcribe_only, diarize_only, hotwords, token,
-        output_dir=output_dir, device=device, title=" ".join((data.get("title") or "").split()),
-    )
+    fingerprint = source_fingerprint(input_path)
+    expected = data.get("source_fingerprint")
+    if expected and fingerprint != expected:
+        raise ValueError("The recording at this path has changed. Import it as a new task.")
+    wav_path = config.CACHE_DIR / f"{input_path.stem}_{fingerprint}_16k.wav"
+    with audio_cache_lock(wav_path):
+        if source_fingerprint(input_path) != fingerprint:
+            raise ValueError("The recording changed before transcription started.")
+        _run_job_impl(
+            input_path, model_name,
+            max_speakers, num_speakers, language,
+            transcribe_only, diarize_only, hotwords, token,
+            output_dir=output_dir, device=device, title=" ".join((data.get("title") or "").split()),
+        )
 
 
 def _run_job_impl(input_path, model_name,
@@ -1314,7 +1322,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     mode.add_argument("--transcribe-only", action="store_true",
                         help="Run Whisper only, skip diarization (no HF token needed)")
     mode.add_argument("--diarize-only", action="store_true",
-                        help="Re-run diarization using cached Whisper result")
+                        help="Require matching Whisper cache; reuse matching diarization cache")
     parser.add_argument("--model", default=None,
                         choices=list(config.SUPPORTED_MODELS),
                         help="Whisper model size (large-v3-turbo/large-v3). Overrides config.py")

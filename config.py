@@ -1,6 +1,6 @@
 """
 simple-video-transcriber configuration
-All user-facing settings live here. Edit this file to customize behavior.
+Defaults for the dashboard and CLI; saved dashboard settings take precedence.
 """
 from pathlib import Path
 import os
@@ -16,7 +16,7 @@ WATCH_DIR = Path(os.environ.get("MEETING_TRANSCRIBER_WATCH_DIR", Path.home() / "
 # Transcripts are written here as Markdown files
 TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
 
-# Intermediate files (16k WAV, JSON caches) — safe to delete any time
+# Intermediate files (16k WAV, JSON caches)
 CACHE_DIR = ROOT_DIR / "cache"
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
@@ -50,14 +50,14 @@ DEVICE = "auto"
 
 # ── Speaker Diarization (pyannote) ───────────────────────────────────────────
 # HuggingFace token — needed to download pyannote models.
-# Leave empty to be prompted at runtime, or set env var HF_TOKEN.
+# Leave empty to use the dashboard token store or HF_TOKEN environment variable.
 # Get a free token at: https://hf.co/settings/tokens
 # Then accept model terms at:
 #   https://hf.co/pyannote/speaker-diarization-3.1
 #   https://hf.co/pyannote/segmentation-3.0
 HF_TOKEN = ""
 
-# Expected number of speakers. Set to an integer for better accuracy.
+# Upper limit on speaker count; use NUM_SPEAKERS for an exact count.
 # None = auto-detect.
 MAX_SPEAKERS = None
 

@@ -4,7 +4,38 @@ from __future__ import annotations
 
 import hashlib
 import re
+import os
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def audio_cache_lock(wav_path: Path):
+    """Exclusively occupy an audio cache; fail immediately if another process owns it."""
+    lock_path = wav_path.with_name(f".{wav_path.stem}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BlockingIOError("Audio cache is in use by another task") from exc
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def source_fingerprint(input_path: Path) -> str:
