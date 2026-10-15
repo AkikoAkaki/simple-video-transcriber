@@ -1,5 +1,5 @@
 faster-whisper>=1.0.0
-pyannote.audio>=3.1.1
+pyannote.audio>=3.1.1,<4
 torch>=2.6.0,<3
 torchaudio>=2.6.0,<3
 watchdog>=3.0.0

@@ -1,13 +1,17 @@
 """Protect transcript content, caches, and publication across failures."""
+import gc
 import io
 import json
 import sys
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import models
 import transcribe
+import transcript
 
 
 def test_failed_conversion_cannot_publish_partial_audio(tmp_path, monkeypatch):
@@ -48,7 +52,7 @@ def test_merge_results_splits_words_when_speaker_changes_mid_segment():
         {"start": 2.1, "end": 4.0, "speaker": "SPEAKER_B"},
     ]
 
-    result = transcribe.merge_results(whisper_segments, speaker_turns)
+    result = transcript.merge_results(whisper_segments, speaker_turns)
 
     assert [(item["speaker"], item["text"]) for item in result] == [
         ("SPEAKER_A", "Hello world"),
@@ -73,7 +77,7 @@ def test_merge_results_preserves_original_cjk_and_subword_spacing():
     }]
     speaker_turns = [{"start": 0.0, "end": 3.0, "speaker": "SPEAKER_A"}]
 
-    result = transcribe.merge_results(whisper_segments, speaker_turns)
+    result = transcript.merge_results(whisper_segments, speaker_turns)
 
     assert len(result) == 1
     assert result[0]["text"] == whisper_segments[0]["text"]
@@ -92,47 +96,44 @@ def test_merge_results_falls_back_without_dropping_segments_missing_words():
     ]
     speaker_turns = [{"start": 0.0, "end": 3.0, "speaker": "SPEAKER_A"}]
 
-    result = transcribe.merge_results(whisper_segments, speaker_turns)
+    result = transcript.merge_results(whisper_segments, speaker_turns)
 
     assert len(result) == 1
     assert "有时间戳" in result[0]["text"]
     assert "没有时间戳" in result[0]["text"]
 
 
-def _stub_job_audio(tmp_path, monkeypatch):
+class FakeWhisper:
+    def transcribe(self, *args, **kwargs):
+        segment = SimpleNamespace(start=0.0, end=2.0, text="Lecture content.", words=[])
+        return iter([segment]), SimpleNamespace(duration=2.0, language="en", language_probability=1.0)
 
+
+class FakePipeline:
+    def __call__(self, *args, **kwargs):
+        return SimpleNamespace(itertracks=lambda **_: iter([
+            (SimpleNamespace(start=0.0, end=2.0), None, "SPEAKER_00")]))
+
+
+def _stub_job_audio(tmp_path, monkeypatch):
     source = tmp_path / "lecture.m4a"
     source.write_bytes(b"audio")
     monkeypatch.setattr(transcribe.config, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(transcribe.config, "TRANSCRIPT_DIR", tmp_path / "transcripts")
     monkeypatch.setattr(transcribe, "convert_to_wav", lambda *_: None)
     monkeypatch.setattr(transcribe, "get_wav_duration", lambda _: 2.0)
-    monkeypatch.setattr(transcribe, "_resolve_device", lambda *args: "cpu")
-    monkeypatch.setattr(transcribe, "clear_diarize_pipeline", lambda: None)
-    monkeypatch.setattr(transcribe, "_release_whisper_before_diarization", lambda: None)
-
-    def recognize(_wav, cache, _language, _hotwords, key, **kwargs):
-        segments = [{"start": 0.0, "end": 2.0, "text": "Lecture content."}]
-        transcribe._write_stage_cache(cache, "whisper", key, segments)
-        return segments
-
-    monkeypatch.setattr(transcribe, "run_whisper", recognize)
+    monkeypatch.setattr(transcribe, "resolve_device", lambda *args: "cpu")
+    monkeypatch.setattr(models, "_load_whisper", lambda *_: FakeWhisper())
+    monkeypatch.setattr(models, "_load_diarization", lambda *_: (FakePipeline(), "cpu"))
     return source
 
 
 def test_cli_and_server_produce_identical_transcripts(tmp_path, monkeypatch):
-
     source = _stub_job_audio(tmp_path, monkeypatch)
-    class Pipeline:
-        def __call__(self, *_args, **_kwargs):
-            return SimpleNamespace(itertracks=lambda **_: iter([
-                (SimpleNamespace(start=0.0, end=2.0), None, "SPEAKER_00")]))
-
-    monkeypatch.setattr(transcribe, "get_diarize_pipeline", lambda *_: Pipeline())
     monkeypatch.setattr(transcribe, "get_hf_token", lambda: "test-token")
     monkeypatch.setattr(sys, "argv", ["transcribe.py", str(source), "--device", "cpu", "--language", "en"])
     transcribe._main()
-    output = transcribe.derive_paths(source)["output_md"]
+    output = transcribe.prepare_paths(source).output_md
     cli_text = output.read_text(encoding="utf-8")
     output.unlink()
     transcribe.run_job_from_json({
@@ -148,25 +149,24 @@ def test_cached_job_skips_audio_and_models_and_keeps_globals(tmp_path, monkeypat
     source = tmp_path / "New Recording 4.m4a"
     source.write_bytes(b"source")
     monkeypatch.setattr(transcribe.config, "CACHE_DIR", tmp_path / "cache")
-    paths = transcribe.derive_paths(source, tmp_path / "out")
+    paths = transcribe.prepare_paths(source, tmp_path / "out")
     key = transcribe._whisper_cache_key("large-v3", "cpu", "en", "", True)
-    transcribe._write_stage_cache(paths["whisper_json"], "whisper", key,
+    transcribe._write_stage_cache(paths.whisper_json, "whisper", key,
         [{"start": 0.0, "end": 2.0, "text": "Lecture content."}], metadata={"total_sec": 5.0})
-    transcribe._write_stage_cache(paths["diarize_json"], "diarization",
+    transcribe._write_stage_cache(paths.diarize_json, "diarization",
         transcribe._diarization_cache_key(None, None),
         [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}])
 
     def unnecessary(*args, **kwargs):
         raise AssertionError("Cached job must not convert audio or touch models")
 
-    for name in ("convert_to_wav", "run_whisper", "run_diarization",
-                 "clear_diarize_pipeline", "_release_whisper_before_diarization"):
+    for name in ("convert_to_wav", "run_whisper", "run_diarization"):
         monkeypatch.setattr(transcribe, name, unnecessary)
     before = (transcribe.config.WHISPER_MODEL, transcribe.config.DEVICE, transcribe.config.TRANSCRIPT_DIR)
     transcribe.run_job_from_json({"input_path": str(source), "output_dir": str(tmp_path / "out"),
                                  "model": "large-v3", "device": "cpu", "language": "en",
                                  "title": "CSC290: Lecture 1"})
-    output = transcribe.derive_paths(source, tmp_path / "out", "CSC290: Lecture 1")["output_md"]
+    output = transcribe.prepare_paths(source, tmp_path / "out", "CSC290: Lecture 1").output_md
     text = output.read_text(encoding="utf-8")
     assert text.startswith("# CSC290: Lecture 1\n")
     assert "00:00:05 (5s)" in text
@@ -176,14 +176,12 @@ def test_cached_job_skips_audio_and_models_and_keeps_globals(tmp_path, monkeypat
     def require_new_recognition(*args, **kwargs):
         raise RuntimeError("New language requires recognition")
     monkeypatch.setattr(transcribe, "convert_to_wav", lambda *args: None)
-    monkeypatch.setattr(transcribe, "clear_diarize_pipeline", lambda: None)
-    monkeypatch.setattr(transcribe, "_release_whisper_before_diarization", lambda: None)
     monkeypatch.setattr(transcribe, "run_whisper", require_new_recognition)
     with pytest.raises(RuntimeError, match="New language requires recognition"):
         transcribe.run_job_from_json({"input_path": str(source), "output_dir": str(output.parent),
                                      "model": "large-v3", "device": "cpu", "language": "zh"})
     source.write_bytes(b"replacement recording")
-    assert transcribe.derive_paths(source, output.parent, "CSC290: Lecture 1")["output_md"] != output
+    assert transcribe.prepare_paths(source, output.parent, "CSC290: Lecture 1").output_md != output
 
 
 def test_markdown_replace_failure_preserves_previous_file(tmp_path, monkeypatch):
@@ -225,13 +223,13 @@ def test_diarization_failure_keeps_transcript_and_recognition_cache(tmp_path, mo
     def load(*args):
         if failure == "model_load":
             raise RuntimeError("model load failed")
-        return Pipeline()
+        return Pipeline(), "cpu"
 
-    monkeypatch.setattr(transcribe, "get_diarize_pipeline", load)
-    paths = transcribe.derive_paths(source)
-    paths["output_md"].write_text("Archived transcript", encoding="utf-8")
+    monkeypatch.setattr(models, "_load_diarization", load)
+    paths = transcribe.prepare_paths(source)
+    paths.output_md.write_text("Archived transcript", encoding="utf-8")
     task = {"command": "transcribe", "job_id": "failure-job",
-            "input_path": str(source), "output_dir": str(paths["output_md"].parent),
+            "input_path": str(source), "output_dir": str(paths.output_md.parent),
             "device": "cpu", "token": token}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(task) + "\n"))
     transcribe.run_server()
@@ -240,32 +238,29 @@ def test_diarization_failure_keeps_transcript_and_recognition_cache(tmp_path, mo
     assert events[-1]["event"] == "failed"
     assert events[-1]["job_id"] == "failure-job"
     assert not any(e["event"] in {"completed", "completed_with_warning"} for e in events)
-    assert paths["output_md"].read_text(encoding="utf-8") == "Archived transcript"
-    assert paths["whisper_json"].is_file() == bool(token)
-    assert not paths["diarize_json"].exists()
+    assert paths.output_md.read_text(encoding="utf-8") == "Archived transcript"
+    assert paths.whisper_json.is_file() == bool(token)
+    assert not paths.diarize_json.exists()
 
 
 def test_batch_releases_models_before_loading_next_stage(tmp_path, monkeypatch):
     _stub_job_audio(tmp_path, monkeypatch)
-    loaded = set()
+    resident = weakref.WeakSet()
 
-    def recognize(*args, **kwargs):
-        assert not loaded, "Previous model still occupies memory before Whisper"
-        loaded.add("whisper")
-        return [{"start": 0.0, "end": 2.0, "text": "Lecture content."}]
+    def loader(make, *placement):
+        def load(*args):
+            gc.collect()
+            assert not resident, "Previous model still occupies memory"
+            model = make()
+            resident.add(model)
+            return (model, *placement) if placement else model
+        return load
 
-    def diarize(*args, **kwargs):
-        assert not loaded, "Whisper still occupies memory before diarization"
-        loaded.add("diarization")
-        return [{"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"}]
-
-    monkeypatch.setattr(transcribe, "run_whisper", recognize)
-    monkeypatch.setattr(transcribe, "run_diarization", diarize)
-    monkeypatch.setattr(transcribe, "clear_diarize_pipeline", lambda: loaded.discard("diarization"))
-    monkeypatch.setattr(transcribe, "_release_whisper_before_diarization", lambda: loaded.discard("whisper"))
+    monkeypatch.setattr(models, "_load_whisper", loader(FakeWhisper))
+    monkeypatch.setattr(models, "_load_diarization", loader(FakePipeline, "cpu"))
     for name in ("first.m4a", "second.m4a"):
         source = tmp_path / name
         source.write_bytes(b"audio")
         transcribe.run_job_from_json({"input_path": str(source), "device": "cpu",
                                      "output_dir": str(tmp_path / "transcripts"), "token": "test-token"})
-        assert "Lecture content." in transcribe.derive_paths(source)["output_md"].read_text(encoding="utf-8")
+        assert "Lecture content." in transcribe.prepare_paths(source).output_md.read_text(encoding="utf-8")

@@ -13,11 +13,9 @@ def dashboard():
     qt = QApplication.instance() or QApplication([])
     svc = SimpleNamespace(
         settings=SimpleNamespace(model="large-v3-turbo", device="auto", watch_dir="", watcher_enabled=False),
-        worker=SimpleNamespace(active=None, cancel_active=MagicMock()),
-        store=SimpleNamespace(recent=lambda limit=20: [], get=lambda job_id: None),
-        token_store=SimpleNamespace(get=lambda: "test-token"),
-        get_cache_size=lambda: "0 B",
-        clear_audio_cache=MagicMock(return_value={"deleted_count": 1, "reclaimed_size": "1 KB"}),
+        active_job=lambda: None, cancel_active=MagicMock(), recent_jobs=lambda limit=20: [],
+        get_job=lambda job_id: None, get_token=lambda: "test-token", cache_size_bytes=lambda: 0,
+        clear_audio_cache=MagicMock(return_value=SimpleNamespace(deleted_count=1, reclaimed_bytes=1024)),
         add_file=MagicMock(return_value={"job_id": "queued"}),
     )
     view = tray_app.Dashboard(SimpleNamespace(service=svc))

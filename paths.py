@@ -7,6 +7,7 @@ import re
 import os
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 
 @contextmanager
@@ -38,60 +39,69 @@ def audio_cache_lock(wav_path: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def source_fingerprint(input_path: Path) -> str:
-    """Return a stable fingerprint for this version of a source file.
+class SourceIdentity(NamedTuple):
+    """One version of a source file.
 
     The path alone is not enough: OBS or a manual workflow can replace a file
     at the same path. Including size and mtime prevents stale ML caches from
     being reused for the new contents while preserving cache hits for an
     unchanged file.
     """
+
+    path: str
+    size: int
+    mtime_ns: int
+
+    @property
+    def key(self) -> str:
+        return f"{self.path}|{self.size}|{self.mtime_ns}"
+
+
+def source_identity(input_path: Path) -> SourceIdentity:
     input_path = Path(input_path).resolve()
     stat = input_path.stat()
-    identity = f"{input_path}|{stat.st_size}|{stat.st_mtime_ns}"
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    return SourceIdentity(str(input_path), stat.st_size, stat.st_mtime_ns)
 
 
-def transcript_path(input_path: Path, output_dir: Path, fingerprint: str | None = None, title: str = "") -> Path:
-    """Return the output path used by both the worker and its controller (Markdown only)."""
-    input_path = Path(input_path)
-    fp = fingerprint or source_fingerprint(input_path)
+def fingerprint(source_key: str) -> str:
+    return hashlib.sha256(source_key.encode("utf-8")).hexdigest()[:12]
+
+
+def source_fingerprint(input_path: Path) -> str:
+    return fingerprint(source_identity(input_path).key)
+
+
+def wav_cache_path(cache_dir: Path, source_stem: str, source_fp: str) -> Path:
+    """The 16 kHz WAV a job converts its source to; its lock guards the partial file too."""
+    return Path(cache_dir) / f"{source_stem}_{source_fp}_16k.wav"
+
+
+def partial_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.part{path.suffix}")
+
+
+class SourceChangedError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("The recording at this path has changed. Import it as a new task.")
+
+
+def transcript_path(input_path: Path, output_dir: Path, source_fp: str, title: str = "") -> Path:
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title).strip().rstrip(". ")[:120] if title else input_path.stem
-    return Path(output_dir) / f"{stem or input_path.stem}_{fp}.md"
+    return output_dir / f"{stem or input_path.stem}_{source_fp}.md"
 
 
-def format_size(num_bytes: int | float | None) -> str:
-    """Format bytes into a human-readable string (e.g., '128.5 MB')."""
-    if num_bytes is None:
-        return "0 B"
-    try:
-        size = float(num_bytes)
-    except (TypeError, ValueError):
-        return "0 B"
-    if size <= 0:
-        return "0 B"
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024.0 or unit == "TB":
-            if unit == "B":
-                return f"{int(size)} B"
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
+class JobPaths(NamedTuple):
+    wav: Path
+    whisper_json: Path
+    diarize_json: Path
+    output_md: Path
 
 
-
-def get_cache_size_bytes(cache_dir: Path | str) -> int:
-    """Calculate the total size in bytes of all files in the cache directory."""
-    path = Path(cache_dir)
-    if not path.is_dir():
-        return 0
-    total = 0
-    try:
-        for entry in path.iterdir():
-            if entry.is_file():
-                try:
-                    total += entry.stat().st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return total
+def job_paths(input_path: Path, cache_dir: Path, output_dir: Path, source_fp: str, title: str = "") -> JobPaths:
+    stem = input_path.stem
+    return JobPaths(
+        wav=wav_cache_path(cache_dir, stem, source_fp),
+        whisper_json=cache_dir / f"_{stem}_{source_fp}_whisper.json",
+        diarize_json=cache_dir / f"_{stem}_{source_fp}_diarize.json",
+        output_md=transcript_path(input_path, output_dir, source_fp, title),
+    )
