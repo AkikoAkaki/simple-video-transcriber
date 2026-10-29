@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -22,6 +23,8 @@ from protocol import SERVER_READY, looks_like_error, parse_event
 
 TRANSCRIBE_SCRIPT = Path(__file__).parent / "transcribe.py"
 WORKER_START_TIMEOUT_SECONDS = 30.0
+# Python and CUDA keep a finished worker's memory; only exiting returns it to the system.
+WORKER_IDLE_EXIT_SECONDS = 180.0
 
 
 class WorkerController:
@@ -38,6 +41,7 @@ class WorkerController:
         self._stop = threading.Event()
         self._job = None
         self._thread: threading.Thread | None = None
+        self._idle_since = time.monotonic()
 
     @property
     def active(self) -> dict | None:
@@ -111,6 +115,7 @@ class WorkerController:
                 row = self._queue.popleft() if self._queue else None
                 self._active = row
             if not row:
+                self._retire_idle_worker()
                 self._stop.wait(0.5)
                 continue
             try:
@@ -123,6 +128,15 @@ class WorkerController:
             finally:
                 with self._lock:
                     self._active = None
+                    self._idle_since = time.monotonic()
+
+    def _retire_idle_worker(self) -> None:
+        with self._lock:
+            proc = self._proc
+            if proc is None or time.monotonic() - self._idle_since < WORKER_IDLE_EXIT_SECONDS:
+                return
+        self._discard_proc(proc)
+        self.on_event("log", {"message": "Worker exited after being idle; models released"})
 
     def _ensure_server_running(self, job_id: str) -> subprocess.Popen:
         with self._lock:
@@ -133,7 +147,9 @@ class WorkerController:
 
             popen_kwargs = {}
             if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # Below normal, so the desktop stays responsive while a long job runs.
+                popen_kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                                 | subprocess.BELOW_NORMAL_PRIORITY_CLASS)
             else:
                 popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(

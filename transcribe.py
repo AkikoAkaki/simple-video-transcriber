@@ -53,6 +53,7 @@ from transcript import format_time, generate_markdown, merge_results
 
 
 CACHE_SCHEMA_VERSION = 2
+SAMPLE_RATE = 16000
 
 
 def _cache_key(kind: str, **params) -> str:
@@ -131,12 +132,17 @@ _EVENT_LOCK = threading.Lock()
 _current_job_id = ""
 
 
+def _print(line: str) -> None:
+    """Recognition and diarization may report at once; keep each output line whole."""
+    with _EVENT_LOCK:
+        print(line, flush=True)
+
+
 def _emit_event(event: str, **payload) -> None:
     if not _current_job_id:
         return
     record = {"event": event, "timestamp": time.time(), "job_id": _current_job_id, **payload}
-    with _EVENT_LOCK:
-        print(format_event(record), flush=True)
+    _print(format_event(record))
 
 
 def _report(stage: str, progress: float, message: str, *, event: str = "stage", **extra) -> None:
@@ -144,7 +150,7 @@ def _report(stage: str, progress: float, message: str, *, event: str = "stage", 
         _emit_event(event, stage=stage, progress=progress, message=message, **extra)
     else:
         step = STAGE_STEPS.get(stage)
-        print(f"[{step}/{STAGE_COUNT}] {message}" if step else message, flush=True)
+        _print(f"[{step}/{STAGE_COUNT}] {message}" if step else message)
 
 
 @contextlib.contextmanager
@@ -207,6 +213,26 @@ def get_wav_duration(wav_path: Path) -> float:
     except (OSError, struct.error):
         pass
     return 0.0
+
+
+def decode_audio(wav_path: Path):
+    from faster_whisper.audio import decode_audio as decode
+    return decode(str(wav_path), sampling_rate=SAMPLE_RATE)
+
+
+class SharedAudio:
+    """The 16 kHz WAV decoded once and shared by Whisper and pyannote."""
+
+    def __init__(self, wav_path: Path):
+        self.path = wav_path
+        self._lock = threading.Lock()
+        self._samples = None
+
+    def samples(self):
+        with self._lock:
+            if self._samples is None:
+                self._samples = decode_audio(self.path)
+            return self._samples
 
 
 def prepare_paths(input_path: Path, output_dir: Path | None = None, title: str = "",
@@ -275,7 +301,7 @@ def convert_to_wav(input_path: Path, output_path: Path):
 
 # ── Step 2: Whisper transcription ─────────────────────────────────────────────
 
-def run_whisper(wav_path: Path, language: str | None, hotwords: str, *,
+def run_whisper(audio: SharedAudio, language: str | None, hotwords: str, *,
                 model_name: str, device: str) -> tuple[list[dict], float | None]:
     """Recognize speech; return the segments and the audio duration Whisper measured."""
     lang_display = language or "auto-detect"
@@ -289,7 +315,7 @@ def run_whisper(wav_path: Path, language: str | None, hotwords: str, *,
     _report("transcribing", 0.0, f"Transcribing [{lang_display}]")
     segments = []
     seg_iter, info = model.transcribe(
-        str(wav_path),
+        audio.samples(),
         language=language,
         word_timestamps=True,
         beam_size=5,
@@ -332,7 +358,7 @@ def run_whisper(wav_path: Path, language: str | None, hotwords: str, *,
             last_progress = progress if progress is not None else last_progress
             last_progress_emit = now
         if len(segments) % 20 == 0:
-            print(f"      ... {len(segments)} segments, up to {format_time(s.end)}", flush=True)
+            _print(f"      ... {len(segments)} segments, up to {format_time(s.end)}")
 
     _report("transcribing", 1.0, f"Transcribed {len(segments)} segments; detected {info.language} "
                                  f"({info.language_probability:.0%})", segments=len(segments))
@@ -341,9 +367,18 @@ def run_whisper(wav_path: Path, language: str | None, hotwords: str, *,
 
 # ── Step 3: Speaker diarization (pyannote) ────────────────────────────────────
 
-def run_diarization(wav_path: Path, token: str, *, num_speakers: int | None,
-                    max_speakers: int | None, device: str) -> list[dict]:
-    _report("loading_diarization", 0.0, f"Loading {DIARIZATION_PIPELINE_ID}")
+def run_diarization(audio: SharedAudio, token: str, *, num_speakers: int | None,
+                    max_speakers: int | None, device: str, announce: bool = True) -> list[dict]:
+    """``announce=False`` logs instead of reporting stages, while recognition owns the job's progress."""
+    import torch
+
+    def report(stage, progress, message, **extra):
+        if announce:
+            _report(stage, progress, message, **extra)
+        else:
+            _print(f"      [diarization] {message}")
+
+    report("loading_diarization", 0.0, f"Loading {DIARIZATION_PIPELINE_ID}")
     try:
         pipeline, device = get_diarize_pipeline(token, device)
     except Exception as e:
@@ -358,10 +393,12 @@ def run_diarization(wav_path: Path, token: str, *, num_speakers: int | None,
     speakers = ({"num_speakers": num_speakers} if num_speakers
                 else {"max_speakers": max_speakers} if max_speakers else {})
     detail = "".join(f", {name}={value}" for name, value in speakers.items())
-    _report("diarizing", 0.0, f"Running speaker diarization on {device}{detail}")
-    with _heartbeat("diarizing", "Speaker diarization is still running"):
+    report("diarizing", 0.0, f"Running speaker diarization on {device}{detail}")
+    waveform = {"waveform": torch.from_numpy(audio.samples())[None], "sample_rate": SAMPLE_RATE}
+    heartbeat = _heartbeat("diarizing", "Speaker diarization is still running") if announce else contextlib.nullcontext()
+    with heartbeat:
         try:
-            diarization = pipeline(str(wav_path), **speakers)
+            diarization = pipeline(waveform, **speakers)
         except RuntimeError as e:
             hint = "; retry on the CPU" if "out of memory" in str(e).lower() else ""
             raise TranscriptionError(f"Speaker diarization failed: {e}{hint}") from e
@@ -373,7 +410,7 @@ def run_diarization(wav_path: Path, token: str, *, num_speakers: int | None,
         turns.append({"start": round(t.start, 2), "end": round(t.end, 2), "speaker": speaker_label})
     if not turns:
         raise TranscriptionError("Speaker diarization returned no speaker turns")
-    _report("diarizing", 1.0, f"Identified {len(turns)} speaker turns", turns=len(turns))
+    report("diarizing", 1.0, f"Identified {len(turns)} speaker turns", turns=len(turns))
     empty_cuda_cache()
     return turns
 
@@ -443,25 +480,36 @@ def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token:
                                  "Save one in the dashboard, or explicitly choose Transcribe only.")
     if whisper is None or (diarize and diarization is None):
         convert_to_wav(input_path, paths.wav)
+    audio = SharedAudio(paths.wav)
+    parallel = device == "cuda" and whisper is None and diarize and diarization is None
 
-    if whisper is None:
-        segments, duration = run_whisper(paths.wav, options.language, options.hotwords,
+    def recognize():
+        segments, duration = run_whisper(audio, options.language, options.hotwords,
                                          model_name=options.model, device=device)
         if not segments:
             raise ValueError("No speech detected in audio")
         _write_stage_cache(paths.whisper_json, "whisper", whisper_key, segments,
                            metadata={"total_sec": duration})
-        whisper = {"result": segments, "total_sec": duration}
+        return {"result": segments, "total_sec": duration}
+
+    def label_speakers():
+        turns = run_diarization(audio, token, num_speakers=options.num_speakers,
+                                max_speakers=options.max_speakers, device=device, announce=not parallel)
+        _write_stage_cache(paths.diarize_json, "diarization", diarization_key, turns)
+        return {"result": turns}
+
+    stages = {}
+    if whisper is None:
+        stages["whisper"] = recognize
     else:
         _report("transcribing", 1.0, f"Loaded {len(whisper['result'])} Whisper segments from cache")
-
     if diarize and diarization is None:
-        turns = run_diarization(paths.wav, token, num_speakers=options.num_speakers,
-                                max_speakers=options.max_speakers, device=device)
-        _write_stage_cache(paths.diarize_json, "diarization", diarization_key, turns)
-        diarization = {"result": turns}
+        stages["diarization"] = label_speakers
     elif diarize:
         _report("diarizing", 1.0, f"Loaded {len(diarization['result'])} speaker turns from cache")
+    results = _run_stages(stages, parallel)
+    whisper = results.get("whisper", whisper)
+    diarization = results.get("diarization", diarization)
     turns = diarization["result"] if diarization else []
 
     _report("merging", 0.0, "Merging transcript and speaker labels")
@@ -480,6 +528,52 @@ def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token:
     write_markdown(paths.output_md, content)
     _report("completed", 1.0, f"✓ Done → {paths.output_md}", event="completed",
             output_path=str(paths.output_md), diarization=bool(turns))
+
+
+def _out_of_memory(exc: BaseException | None) -> bool:
+    while exc is not None:
+        if isinstance(exc, MemoryError) or "out of memory" in str(exc).lower():
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def _run_stages(stages: dict, parallel: bool) -> dict:
+    """Run recognition and diarization, at the same time on the GPU when ``parallel``.
+
+    Both models stay loaded between jobs, so a stage that runs out of memory is retried once alone
+    after every model is released. Any other failure is raised once the other stage has finished
+    and cached its result.
+    """
+    names = list(stages)
+    results, errors = {}, {}
+
+    def run(name):
+        try:
+            results[name] = stages[name]()
+        except Exception as exc:
+            errors[name] = exc
+
+    if parallel and len(names) > 1:
+        helper = threading.Thread(target=run, args=(names[1],), name=f"{names[1]}-stage", daemon=True)
+        helper.start()
+        run(names[0])
+        if helper.is_alive() and names[0] not in errors:
+            _report("diarizing", 0.0, "Finishing speaker diarization")
+        helper.join()
+    else:
+        for name in names:
+            run(name)
+            if name in errors and not _out_of_memory(errors[name]):
+                break
+    for name in [name for name in names if _out_of_memory(errors.get(name))]:
+        _print(f"[WARN] {name} ran out of memory ({errors.pop(name)}); retrying it alone")
+        release_models()
+        run(name)
+    for name in names:
+        if name in errors:
+            raise errors[name]
+    return results
 
 
 def write_markdown(path: Path, content: str) -> None:
