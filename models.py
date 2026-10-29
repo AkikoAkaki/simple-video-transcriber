@@ -1,4 +1,4 @@
-"""Load the Whisper and pyannote models once and keep both resident across a job queue."""
+"""Load the recognition and diarization models once and keep them resident across a job queue."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import gc
 import math
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -15,6 +16,13 @@ import config
 
 
 DIARIZATION_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
+# English speech on the GPU goes to Parakeet; on lectures it keeps Whisper's content at 2.5x the speed.
+PARAKEET_LABEL = "Parakeet TDT 0.6B v3"
+_PARAKEET_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+_PARAKEET_FILES = ("config.json", "vocab.txt", "nemo128.onnx", "encoder-model.onnx",
+                   "encoder-model.onnx.data", "decoder_joint-model.onnx")
+# A small multilingual Whisper decides which recognizer an auto-detect job uses.
+LANGUAGE_ID_MODEL = "base"
 
 
 def compute_type(device: str) -> str:
@@ -107,7 +115,33 @@ def resolve_device(device: str | None = None) -> str:
 
 def _load_whisper(model_name: str, device: str):
     from faster_whisper import WhisperModel
-    return WhisperModel(model_name, device=device, compute_type=compute_type(device))
+    from faster_whisper.utils import download_model
+    if device == "cuda":
+        _load_cuda_libraries()
+    try:
+        # A downloaded model loads without the HuggingFace update check, which costs about 2s per load.
+        model_path = download_model(model_name, local_files_only=True)
+    except Exception:
+        model_path = model_name
+    return WhisperModel(model_path, device=device, compute_type=compute_type(device))
+
+
+def _load_parakeet():
+    """Parakeet through onnx-asr on CUDA, returning token timestamps."""
+    import onnx_asr
+    import onnxruntime
+    from huggingface_hub import snapshot_download
+
+    from appdata import APP_DATA_DIR
+    # A plain folder: onnxruntime rejects external weights reached through HuggingFace cache links.
+    folder = APP_DATA_DIR / "models" / "parakeet-tdt-0.6b-v3"
+    if not all((folder / name).is_file() for name in _PARAKEET_FILES):
+        snapshot_download(_PARAKEET_REPO, allow_patterns=list(_PARAKEET_FILES), local_dir=folder)
+    _load_cuda_libraries()
+    # Hide per-node placement warnings; onnxruntime deliberately keeps shape ops on the CPU.
+    onnxruntime.set_default_logger_severity(3)
+    model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", folder, providers=["CUDAExecutionProvider"])
+    return model.with_timestamps()
 
 
 def _load_diarization(token: str, device: str):
@@ -190,46 +224,57 @@ def _half_precision_embeddings(pipeline) -> None:
     resnet.forward = half_forward
 
 
-_whisper = None  # ((model_name, device), model)
-_diarization = None  # ((token, requested device), pipeline, device it runs on)
+class _Resident:
+    """One model kept loaded between jobs, reloaded when its parameters change.
+
+    A preload thread and a job stage can ask for the same model; the second caller waits for the
+    first load instead of loading it again.
+    """
+
+    def __init__(self, load):
+        self._load = load
+        self._lock = threading.RLock()
+        self._entry = None  # (params, model)
+
+    def get(self, *params):
+        with self._lock:
+            if self._entry is None or self._entry[0] != params:
+                self.release()
+                self._entry = (params, self._load(*params))
+            return self._entry[1]
+
+    def release(self) -> None:
+        with self._lock:
+            if self._entry is not None:
+                self._entry = None
+                gc.collect()
+                empty_cuda_cache()
+
+
+# The loaders are looked up at call time so tests can replace them.
+_whisper = _Resident(lambda model_name, device: _load_whisper(model_name, device))
+_language_id = _Resident(lambda device: _load_whisper(LANGUAGE_ID_MODEL, device))
+_parakeet = _Resident(lambda: _load_parakeet())
+_diarization = _Resident(lambda token, device: _load_diarization(token, device))
 
 
 def get_whisper_model(model_name: str, device: str):
-    global _whisper
-    params = (model_name, device)
-    if _whisper is None or _whisper[0] != params:
-        release_whisper_model()
-        if device == "cuda":
-            _load_cuda_libraries()
-        _whisper = (params, _load_whisper(model_name, device))
-    return _whisper[1]
+    return _whisper.get(model_name, device)
+
+
+def get_language_id_model(device: str):
+    return _language_id.get(device)
+
+
+def get_parakeet_model():
+    return _parakeet.get()
 
 
 def get_diarize_pipeline(token: str, device: str):
     """Return the pipeline and the device it runs on."""
-    global _diarization
-    params = (token, device)
-    if _diarization is None or _diarization[0] != params:
-        release_diarize_pipeline()
-        _diarization = (params, *_load_diarization(token, device))
-    return _diarization[1], _diarization[2]
-
-
-def release_whisper_model() -> None:
-    global _whisper
-    if _whisper is not None:
-        _whisper = None
-        gc.collect()
-        empty_cuda_cache()
-
-
-def release_diarize_pipeline() -> None:
-    global _diarization
-    if _diarization is not None:
-        _diarization = None
-        empty_cuda_cache()
+    return _diarization.get(token, device)
 
 
 def release_models() -> None:
-    release_whisper_model()
-    release_diarize_pipeline()
+    for model in (_whisper, _language_id, _parakeet, _diarization):
+        model.release()

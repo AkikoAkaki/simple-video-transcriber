@@ -1,4 +1,8 @@
 faster-whisper>=1.0.0
+onnx-asr>=0.12
+# Parakeet on CUDA 12. faster-whisper pulls in the CPU onnxruntime, which shares files
+# with this package; install.bat removes it and reinstalls this one.
+onnxruntime-gpu>=1.20,<1.27
 pyannote.audio>=3.1.1,<4
 torch>=2.6.0,<3
 torchaudio>=2.6.0,<3

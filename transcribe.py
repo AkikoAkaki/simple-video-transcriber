@@ -45,7 +45,8 @@ warnings.filterwarnings("ignore", message=".*resume_download.*")
 
 import config
 from appdata import TokenStore
-from models import (DIARIZATION_PIPELINE_ID, compute_type, empty_cuda_cache, get_diarize_pipeline,
+from models import (DIARIZATION_PIPELINE_ID, LANGUAGE_ID_MODEL, PARAKEET_LABEL, compute_type,
+                    empty_cuda_cache, get_diarize_pipeline, get_language_id_model, get_parakeet_model,
                     get_whisper_model, release_models, resolve_device)
 from paths import JobPaths, SourceChangedError, audio_cache_lock, job_paths, partial_path, source_fingerprint
 from protocol import SERVER_READY, STAGE_COUNT, STAGE_STEPS, JobOptions, format_event
@@ -54,6 +55,14 @@ from transcript import format_time, generate_markdown, merge_results
 
 CACHE_SCHEMA_VERSION = 2
 SAMPLE_RATE = 16000
+# Auto-detect jobs use Parakeet only when the language ID is at least this sure the speech is English.
+ENGLISH_CONFIDENCE = 0.8
+# Parakeet attends over the whole clip, so speech is cut into spans of at most this length.
+PARAKEET_MAX_SPAN_SEC = 25
+# Batch 16 was slower than 8 on an 8 GB card and nearly filled it.
+PARAKEET_BATCH = 8
+# onnx-asr reports when each token starts; a word ends at most this long after its last token.
+_WORD_TAIL_SEC = 0.24
 
 
 def _cache_key(kind: str, **params) -> str:
@@ -107,13 +116,25 @@ def select_initial_prompt(language: str | None) -> str | None:
 
 
 def _whisper_cache_key(model_name: str, device: str, language: str | None,
-                       hotwords: str | None, word_timestamps: bool) -> str:
-    return _cache_key(
-        "whisper", model=model_name, device=device, compute_type=compute_type(device),
-        language=language or "auto", hotwords=hotwords or "",
-        word_timestamps=bool(word_timestamps),
-        initial_prompt=select_initial_prompt(language) or "",
-    )
+                       hotwords: str | None, word_timestamps: bool, recognizer: str = "whisper") -> str:
+    params = dict(model=model_name, device=device, compute_type=compute_type(device),
+                  language=language or "auto", hotwords=hotwords or "",
+                  word_timestamps=bool(word_timestamps),
+                  initial_prompt=select_initial_prompt(language) or "")
+    if recognizer != "whisper":
+        # An auto-detect job picks its recognizer from the audio, so the key records the rule.
+        params["recognizer"] = f"{recognizer}:{PARAKEET_LABEL}:{LANGUAGE_ID_MODEL}>={ENGLISH_CONFIDENCE}"
+    return _cache_key("whisper", **params)
+
+
+def choose_recognizer(language: str | None, hotwords: str | None, device: str) -> str:
+    """Return "whisper", "parakeet", or "detect" (identify the language from the audio first)."""
+    # Parakeet takes no prompt, so a job with names or terms keeps Whisper.
+    if device != "cuda" or not config.PARAKEET_FOR_ENGLISH or (hotwords or "").strip():
+        return "whisper"
+    if not language:
+        return "detect"
+    return "parakeet" if language.lower() == "en" else "whisper"
 
 
 def _diarization_cache_key(max_speakers: int | None, num_speakers: int | None) -> str:
@@ -365,6 +386,79 @@ def run_whisper(audio: SharedAudio, language: str | None, hotwords: str, *,
     return segments, getattr(info, "duration", None)
 
 
+def identify_language(audio: SharedAudio, device: str) -> tuple[str, float]:
+    """Language of the first speech in the recording, from up to three 30 s windows."""
+    from faster_whisper.vad import VadOptions
+
+    model = get_language_id_model(device)
+    language, probability, _ = model.detect_language(
+        audio.samples()[:300 * SAMPLE_RATE], vad_filter=True,
+        vad_parameters=VadOptions(min_silence_duration_ms=2000), language_detection_segments=3)
+    return language, probability
+
+
+def run_parakeet(audio: SharedAudio) -> tuple[list[dict], float]:
+    """Recognize English speech with Parakeet; return Whisper-shaped segments and the duration."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    _report("loading_whisper", 0.0, f"Loading {PARAKEET_LABEL}")
+    try:
+        model = get_parakeet_model()
+    except Exception as e:
+        raise TranscriptionError(f"Failed to load {PARAKEET_LABEL}: {e}") from e
+
+    samples = audio.samples()
+    _report("transcribing", 0.0, f"Transcribing [en] with {PARAKEET_LABEL}")
+    # Whisper's VAD settings; onnx-asr's own VAD splitting garbled whole passages of a lecture.
+    spans = get_speech_timestamps(samples, VadOptions(min_silence_duration_ms=2000,
+                                                      max_speech_duration_s=PARAKEET_MAX_SPAN_SEC))
+    # Similar lengths batch with little padding; results go back to their spans afterwards.
+    order = sorted(range(len(spans)), key=lambda i: spans[i]["end"] - spans[i]["start"])
+    results = [None] * len(spans)
+    total = sum(span["end"] - span["start"] for span in spans) or 1
+    done = 0
+    for first in range(0, len(order), PARAKEET_BATCH):
+        batch = order[first:first + PARAKEET_BATCH]
+        clips = [samples[spans[i]["start"]:spans[i]["end"]] for i in batch]
+        for i, result in zip(batch, model.recognize(clips, sample_rate=SAMPLE_RATE), strict=True):
+            results[i] = result
+        done += sum(len(clip) for clip in clips)
+        _emit_event("progress", stage="transcribing", progress=min(done / total, 0.99),
+                    message=f"Transcribed {done / total:.0%} of the speech")
+
+    segments = [segment for span, result in zip(spans, results)
+                for segment in _sentence_segments(span["start"] / SAMPLE_RATE, span["end"] / SAMPLE_RATE, result)]
+    _report("transcribing", 1.0, f"Transcribed {len(segments)} segments with {PARAKEET_LABEL}",
+            segments=len(segments))
+    return segments, len(samples) / SAMPLE_RATE
+
+
+def _sentence_segments(start: float, end: float, result) -> list[dict]:
+    """Split one recognized span into sentences with word timestamps, the shape Whisper produces."""
+    words = []
+    for token, offset in zip(result.tokens or [], result.timestamps or []):
+        if token.startswith(" ") or not words:
+            words.append({"start": start + offset, "last": start + offset, "word": " " + token.lstrip()})
+        else:
+            words[-1]["word"] += token
+            words[-1]["last"] = start + offset
+    segments, sentence = [], []
+    for n, word in enumerate(words):
+        following = words[n + 1]["start"] if n + 1 < len(words) else end
+        word["end"] = max(word["start"], min(following, word.pop("last") + _WORD_TAIL_SEC))
+        sentence.append(word)
+        if word["word"].rstrip().endswith((".", "?", "!")) or n + 1 == len(words):
+            text = "".join(w["word"] for w in sentence).strip()
+            if text:
+                segments.append({
+                    "start": round(sentence[0]["start"], 2), "end": round(sentence[-1]["end"], 2), "text": text,
+                    "words": [{"start": round(w["start"], 2), "end": round(w["end"], 2), "word": w["word"]}
+                              for w in sentence],
+                })
+            sentence = []
+    return segments
+
+
 # ── Step 3: Speaker diarization (pyannote) ────────────────────────────────────
 
 def run_diarization(audio: SharedAudio, token: str, *, num_speakers: int | None,
@@ -467,8 +561,9 @@ def run_job_from_json(data: dict):
 def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token: str):
     device = resolve_device(options.device)
     diarize = options.mode != "transcribe"
+    recognizer = choose_recognizer(options.language, options.hotwords, device)
     whisper_key = _whisper_cache_key(options.model, device, options.language, options.hotwords,
-                                     word_timestamps=True)
+                                     word_timestamps=True, recognizer=recognizer)
     diarization_key = _diarization_cache_key(options.max_speakers, options.num_speakers)
 
     whisper = _read_stage_cache(paths.whisper_json, "whisper", whisper_key)
@@ -479,18 +574,31 @@ def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token:
         raise TranscriptionError("Speaker diarization requires a HuggingFace token. "
                                  "Save one in the dashboard, or explicitly choose Transcribe only.")
     if whisper is None or (diarize and diarization is None):
+        _preload_models(options.model, recognizer, device, token,
+                        recognition=whisper is None, diarization=diarize and diarization is None)
         convert_to_wav(input_path, paths.wav)
     audio = SharedAudio(paths.wav)
     parallel = device == "cuda" and whisper is None and diarize and diarization is None
 
     def recognize():
-        segments, duration = run_whisper(audio, options.language, options.hotwords,
-                                         model_name=options.model, device=device)
+        chosen = recognizer
+        if chosen == "detect":
+            language, probability = identify_language(audio, device)
+            chosen = "parakeet" if language == "en" and probability >= ENGLISH_CONFIDENCE else "whisper"
+            _report("transcribing", 0.0, f"Detected {language} ({probability:.0%}); recognizing with "
+                                         f"{PARAKEET_LABEL if chosen == 'parakeet' else 'Whisper'}")
+        if chosen == "parakeet":
+            segments, duration = run_parakeet(audio)
+            label = PARAKEET_LABEL
+        else:
+            segments, duration = run_whisper(audio, options.language, options.hotwords,
+                                             model_name=options.model, device=device)
+            label = f"Whisper {options.model}"
         if not segments:
             raise ValueError("No speech detected in audio")
         _write_stage_cache(paths.whisper_json, "whisper", whisper_key, segments,
-                           metadata={"total_sec": duration})
-        return {"result": segments, "total_sec": duration}
+                           metadata={"total_sec": duration, "model_label": label})
+        return {"result": segments, "total_sec": duration, "model_label": label}
 
     def label_speakers():
         turns = run_diarization(audio, token, num_speakers=options.num_speakers,
@@ -524,15 +632,40 @@ def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token:
     _report("writing", 0.0, f"Writing {len(segments)} transcript blocks")
     content = generate_markdown(segments, input_path.name, total_sec,
                                 DIARIZATION_PIPELINE_ID if turns else None, options.language,
-                                title=options.title, model_name=options.model)
+                                title=options.title,
+                                model_label=whisper.get("model_label") or f"Whisper {options.model}")
     write_markdown(paths.output_md, content)
     _report("completed", 1.0, f"✓ Done → {paths.output_md}", event="completed",
             output_path=str(paths.output_md), diarization=bool(turns))
 
 
+def _preload_models(model_name: str, recognizer: str, device: str, token: str, *,
+                    recognition: bool, diarization: bool):
+    """Load the models while ffmpeg converts the audio, so the first job after a worker start does not
+    wait for each in turn. A failed preload is ignored; the stage loads again and reports the error."""
+    loaders = []
+    if recognition and recognizer == "detect":
+        loaders.append(lambda: get_language_id_model(device))
+    if recognition and recognizer in ("detect", "parakeet"):
+        loaders.append(get_parakeet_model)
+    elif recognition:
+        loaders.append(lambda: get_whisper_model(model_name, device))
+    if diarization:
+        loaders.append(lambda: get_diarize_pipeline(token, device))
+
+    def load():
+        for loader in loaders:
+            with contextlib.suppress(Exception):
+                loader()
+
+    threading.Thread(target=load, name="model-preload", daemon=True).start()
+
+
 def _out_of_memory(exc: BaseException | None) -> bool:
     while exc is not None:
-        if isinstance(exc, MemoryError) or "out of memory" in str(exc).lower():
+        message = str(exc).lower()
+        # onnxruntime reports a full GPU as a failed allocation.
+        if isinstance(exc, MemoryError) or "out of memory" in message or "failed to allocate memory" in message:
             return True
         exc = exc.__cause__
     return False

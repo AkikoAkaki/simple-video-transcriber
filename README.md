@@ -18,6 +18,8 @@ Double-click a recent task or click **Open result** to open its Markdown. **Retr
 
 Choose **Transcribe only** explicitly for recordings known to contain one speaker when labels are unnecessary. Use **Full pipeline** for lectures with student interaction, seminars, and meetings. Leave speaker counts automatic unless known; **Exact speakers** takes precedence over **Max speakers**. **Names / terms** provides recognition hints, not verified speaker identities.
 
+On an NVIDIA GPU, English speech is recognized with Parakeet TDT 0.6B v3, about 2.5x faster than Whisper; on a 69-minute lecture it kept every student question. With auto-detect, a small Whisper model first identifies the language from the opening minutes, and anything below 80% English confidence uses Whisper. Chinese and other languages, CPU runs, and jobs with **Names / terms** use Whisper, because Parakeet takes no prompt. The first Parakeet job downloads about 2.5 GB to `%LOCALAPPDATA%/SimpleVideoTranscriber/models/`. Set `PARAKEET_FOR_ENGLISH = False` in `config.py` to always use Whisper.
+
 ## Install and start
 
 Requires Windows, Python 3.10+, and ffmpeg. `install.bat` checks Python, attempts to install missing ffmpeg through winget, and installs `requirements.txt` into `.venv`. Then run `start.bat`.
@@ -41,7 +43,7 @@ python transcribe.py "solo-lecture.m4a" --transcribe-only
 python transcribe.py "meeting.mp4" --diarize-only
 ```
 
-`--diarize-only` reuses Whisper results matching the current recognition settings; matching diarization results are also reused. Keep recognition caches when retrying failures. Overrides include `--model large-v3`, `--device cpu`, `--max-speakers 3`, and `--output-dir ./transcripts`. CLI token sources include the dashboard store, the `HF_TOKEN` environment variable, and `config.py`.
+`--diarize-only` reuses recognition results matching the current recognition settings; matching diarization results are also reused. Keep recognition caches when retrying failures. Overrides include `--model large-v3`, `--device cpu`, `--max-speakers 3`, and `--output-dir ./transcripts`. CLI token sources include the dashboard store, the `HF_TOKEN` environment variable, and `config.py`.
 
 ## Files and settings
 
@@ -51,7 +53,7 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 CLI and dashboard tasks cannot process the same recording version concurrently. If another task is using it, transcription fails with an audio-cache-in-use error; retry after that task finishes. **Clear Audio Cache** skips WAVs in use.
 
-`config.py` supplies defaults. The tray uses settings saved by the dashboard; CLI arguments override the corresponding defaults. The default model is `large-v3-turbo`, with `large-v3` also available; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed in the dashboard or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
+`config.py` supplies defaults. The tray uses settings saved by the dashboard; CLI arguments override the corresponding defaults. The default Whisper model is `large-v3-turbo`, with `large-v3` also available, for jobs that use Whisper; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed in the dashboard or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
 
 Transcription settings are captured when a task is queued. Missing tokens fail early unless a valid diarization cache exists. Matching recognition and diarization caches bypass audio extraction and model execution.
 

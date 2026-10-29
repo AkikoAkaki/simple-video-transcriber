@@ -18,6 +18,8 @@
 
 确定是单人录音且不需要区分说话人时，可显式选择 **Transcribe only**。包含学生互动的 lecture、seminar 或多人会议使用 **Full pipeline**。人数不确定时保持自动估计；已知准确人数时填写 **Exact speakers**。人名和术语可以填入 **Names / terms**，但说话人标签仍是编号，不代表已核实身份。
 
+在 NVIDIA GPU 上，英文语音用 Parakeet TDT 0.6B v3 识别，比 Whisper 快约 2.5 倍；在一场 69 分钟的 lecture 上，学生提问都保留了。语言为自动检测时，先用一个小 Whisper 模型根据开头几分钟判断语言，英文置信度低于 80% 的仍用 Whisper。中文和其他语言、CPU 运行，以及填写了 **Names / terms** 的任务都用 Whisper，因为 Parakeet 不支持提示词。第一次用 Parakeet 会下载约 2.5 GB 到 `%LOCALAPPDATA%/SimpleVideoTranscriber/models/`。在 `config.py` 设 `PARAKEET_FOR_ENGLISH = False` 可始终使用 Whisper。
+
 ## 安装与启动
 
 需要 Windows、Python 3.10+ 和 ffmpeg。`install.bat` 检查 Python、尝试通过 winget 安装缺失的 ffmpeg，并在 `.venv` 安装 `requirements.txt`。安装后用 `start.bat` 启动。
@@ -41,7 +43,7 @@ python transcribe.py "solo-lecture.m4a" --transcribe-only
 python transcribe.py "meeting.mp4" --diarize-only
 ```
 
-`--diarize-only` 复用匹配当前识别参数的 Whisper 缓存；匹配的说话人分离缓存也会复用。失败后重试不需要删除识别缓存。可用 `--model large-v3`、`--device cpu`、`--max-speakers 3`、`--output-dir ./transcripts` 覆盖默认值。Token 可从 dashboard 存储、`HF_TOKEN` 环境变量或 `config.py` 读取。
+`--diarize-only` 复用匹配当前识别参数的识别缓存；匹配的说话人分离缓存也会复用。失败后重试不需要删除识别缓存。可用 `--model large-v3`、`--device cpu`、`--max-speakers 3`、`--output-dir ./transcripts` 覆盖默认值。Token 可从 dashboard 存储、`HF_TOKEN` 环境变量或 `config.py` 读取。
 
 ## 输出与配置
 
@@ -51,7 +53,7 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 CLI 与 dashboard 不能同时处理同一版本的录音。其他任务正在使用它时，转录会报音频缓存被占用，等该任务结束后再重试。**Clear Audio Cache** 会跳过占用中的 WAV。
 
-`config.py` 提供默认设置；dashboard 保存的设置供托盘使用，命令行参数覆盖对应默认值。默认模型为 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在 dashboard 修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
+`config.py` 提供默认设置；dashboard 保存的设置供托盘使用，命令行参数覆盖对应默认值。走 Whisper 的任务默认用 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在 dashboard 修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
 
 任务入队时保存转录设置。缺少 Token 且没有可用分离缓存时提前失败；识别和分离缓存均匹配时，跳过音频提取和模型运行。
 

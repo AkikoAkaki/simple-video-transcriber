@@ -35,6 +35,12 @@ def normalize_whisper_model(value) -> str:
         return value
     return WHISPER_MODEL
 
+# English speech on an NVIDIA GPU is recognized with Parakeet TDT 0.6B v3 instead
+# of Whisper: about 2.5x faster with the same content on lectures. Auto-detect jobs
+# first identify the language; other languages, CPU runs, and jobs with names or
+# terms (which Parakeet cannot use) keep Whisper. First use downloads about 2.5 GB.
+PARAKEET_FOR_ENGLISH = True
+
 # Transcription language:
 #   None  → auto-detect (recommended for mixed-language audio)
 #   "en"  → force English

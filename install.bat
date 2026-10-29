@@ -75,6 +75,13 @@ if %errorlevel% neq 0 (
     echo [ERROR] Failed to install dependencies.
     goto :FAIL
 )
+:: faster-whisper pulls in the CPU onnxruntime, which overwrites files shared with onnxruntime-gpu.
+python -m pip uninstall -y onnxruntime
+python -m pip install --force-reinstall --no-deps "onnxruntime-gpu>=1.20,<1.27"
+if %errorlevel% neq 0 (
+    echo [ERROR] Failed to install onnxruntime-gpu.
+    goto :FAIL
+)
 echo [OK] All dependencies installed.
 
 echo.

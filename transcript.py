@@ -148,13 +148,13 @@ def merge_results(whisper_segments: list[dict], speaker_turns: list[dict]) -> li
 
 def generate_markdown(segments: list[dict], source_file: str, total_sec: float,
                       diarization: str | None, language: str | None,
-                      *, title: str = "", model_name: str) -> str:
+                      *, title: str = "", model_label: str) -> str:
     """Render the transcript; ``diarization`` names the pipeline, or None when it was skipped."""
     lines = [
         f"# {title or 'Transcript'}", "",
         f"**Source**: {source_file}",
         f"**Duration**: {format_time(total_sec)} ({int(total_sec)}s)",
-        f"**Model**: Whisper {model_name}  |  Language: {language or 'auto-detect'}",
+        f"**Model**: {model_label}  |  Language: {language or 'auto-detect'}",
         f"**Diarization**: {diarization or 'disabled'}",
         "", "---", "",
     ]
