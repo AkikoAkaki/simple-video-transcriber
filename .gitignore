@@ -24,3 +24,6 @@ dist/
 build/
 .venv/
 venv/
+
+# Obsidian plugin build
+obsidian-plugin/node_modules/

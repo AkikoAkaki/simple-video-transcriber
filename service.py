@@ -37,7 +37,10 @@ class BackgroundService:
         self._log_lock = threading.Lock()
         self._log_count = 0
         self.worker = WorkerController(self.settings, self.store, self.token_store, self._event)
-        self.watcher = FileWatcher(self.settings, lambda path: self.add_file(path, from_watcher=True), self._event)
+        self.watcher = FileWatcher(self.settings, self._recording_ready, self._event)
+        # Finished recordings from the watch folder wait here until the user chooses to transcribe them.
+        self._offers: dict[str, Path] = {}
+        self._offers_lock = threading.Lock()
         self._started = False
 
     def start(self) -> None:
@@ -83,6 +86,49 @@ class BackgroundService:
 
     def add_file(self, path: Path, overrides: dict | None = None, *, from_watcher: bool = False) -> dict | None:
         return self._enqueue(path, replace(self.settings.job_options(), **(overrides or {})), from_watcher)
+
+    def add_files(self, paths) -> list[dict]:
+        """Queue each audio or video file once; folders, other files, and repeats are skipped."""
+        rows, seen = [], set()
+        for path in map(Path, paths):
+            if path.suffix.lower() not in config.WATCH_EXTENSIONS or not path.is_file():
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            with self._offers_lock:
+                self._offers.pop(key, None)
+            row = self.add_file(path)
+            if row:
+                rows.append(row)
+        return rows
+
+    def _recording_ready(self, path: Path) -> None:
+        """Offer a finished recording instead of queueing it: most OBS recordings need no transcript."""
+        if self.store.knows(path):
+            return
+        key = str(path.resolve())
+        with self._offers_lock:
+            if key in self._offers:
+                return
+            self._offers[key] = path
+        self._event("recording_ready", {"path": key, "message": f"New recording: {path.name}"})
+
+    def offered_recordings(self) -> list[str]:
+        with self._offers_lock:
+            return list(self._offers)
+
+    def accept_recording(self, path: str) -> dict | None:
+        with self._offers_lock:
+            recording = self._offers.pop(path, None)
+        if recording is None:
+            raise ValueError("This recording is no longer waiting for a decision.")
+        return self._enqueue(recording, self.settings.job_options(), from_watcher=True)
+
+    def dismiss_recording(self, path: str) -> None:
+        with self._offers_lock:
+            self._offers.pop(path, None)
 
     def retry_job(self, job_id: str) -> dict | None:
         row = self.store.get(job_id)

@@ -74,6 +74,11 @@ NUM_SPEAKERS = None
 # Optional comma-separated names and technical terms passed to Whisper.
 HOTWORDS = ""
 
+# ── Local API ────────────────────────────────────────────────────────────────
+# The Obsidian plugin and the Explorer "转录" menu reach the tray on this
+# 127.0.0.1 port.
+API_PORT = 47321
+
 # ── Watcher ──────────────────────────────────────────────────────────────────
 # Files smaller than this are ignored (filters out accidental tiny files).
 MIN_FILE_SIZE_KB = 100

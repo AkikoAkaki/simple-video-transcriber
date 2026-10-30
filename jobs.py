@@ -199,6 +199,15 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def knows(self, path: Path) -> bool:
+        """Whether this version of the recording already has a task, finished or not."""
+        try:
+            key = source_identity(path).key
+        except OSError:
+            return False
+        with self._connect() as conn:
+            return conn.execute("SELECT 1 FROM jobs WHERE source_key = ?", (key,)).fetchone() is not None
+
     def recent(self, limit: int = 20) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()

@@ -43,7 +43,7 @@ def test_retry_keeps_settings_and_rejects_replaced_recording(svc, tmp_path):
         svc.retry_job(original["job_id"])
 
 
-def test_watcher_skips_archive_and_waits_for_finished_recording(svc, tmp_path, monkeypatch):
+def test_watcher_offers_only_finished_new_recordings(svc, tmp_path, monkeypatch):
     settings = svc.settings
     settings.watch_dir = str(tmp_path)
     settings.stable_seconds = 1
@@ -62,15 +62,15 @@ def test_watcher_skips_archive_and_waits_for_finished_recording(svc, tmp_path, m
         watcher.moved(archive, archive.rename(tmp_path / "renamed.m4a"))
         watcher.rescan()
         watcher.tick_once(now)
-        assert svc.store.queued() == []
+        assert svc.offered_recordings() == []
         source = tmp_path / "recording.m4a"
         source.write_bytes(b"start")
         watcher.rescan()
         source.write_bytes(b"still recording")
         watcher.tick_once(now)
-        assert svc.store.queued() == []
+        assert svc.offered_recordings() == []
         watcher.tick_once(now + 0.5)
-        assert svc.store.queued() == []
+        assert svc.offered_recordings() == []
         original_open = open
         locked = True
 
@@ -81,13 +81,16 @@ def test_watcher_skips_archive_and_waits_for_finished_recording(svc, tmp_path, m
 
         monkeypatch.setattr("builtins.open", open_recording)
         watcher.tick_once(now + 2)
-        assert svc.store.queued() == []
+        assert svc.offered_recordings() == []
         locked = False
         watcher.tick_once(now + 4)
-        assert [row["source_path"] for row in svc.store.queued()] == [str(source.resolve())]
+        assert svc.offered_recordings() == [str(source.resolve())]
+        assert svc.store.queued() == []  # offered, not queued, until the user accepts it
         watcher.rescan()
         watcher.tick_once(now + 6)
-        assert len(svc.store.queued()) == 1
+        assert len(svc.offered_recordings()) == 1
+        svc.accept_recording(str(source.resolve()))
+        assert [row["source_path"] for row in svc.store.queued()] == [str(source.resolve())]
     finally:
         watcher.stop()
 
