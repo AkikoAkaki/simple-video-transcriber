@@ -32,6 +32,24 @@ def _is_supported(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in config.WATCH_EXTENSIONS
 
 
+def _released(path: Path) -> bool | None:
+    """Whether the recorder has let go of the file; None when the file is gone."""
+    try:
+        with open(path, "r+b"):
+            return True
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in {None, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION}:
+            return False
+    # Another error, such as a read-only archive, still allows transcription if it is readable.
+    try:
+        with open(path, "rb"):
+            return True
+    except OSError:
+        return False
+
+
 class _WatchHandler(FileSystemEventHandler):
     def __init__(self, owner: "FileWatcher"):
         self.owner = owner
@@ -40,9 +58,7 @@ class _WatchHandler(FileSystemEventHandler):
         if not event.is_directory:
             self.owner.track(Path(event.src_path))
 
-    def on_modified(self, event):
-        if not event.is_directory:
-            self.owner.track(Path(event.src_path))
+    on_modified = on_created
 
     def on_moved(self, event):
         if not event.is_directory:
@@ -188,26 +204,15 @@ class FileWatcher:
                 continue
             if now - last_changed < self.settings.stable_seconds:
                 continue
-            try:
-                with open(path, "r+b"):
-                    pass
-            except FileNotFoundError:
+            released = _released(path)
+            if released is None:
                 with self._lock:
                     self._pending.pop(key, None)
                 continue
-            except OSError as exc:
-                if getattr(exc, "winerror", None) in {None, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION}:
-                    with self._lock:
-                        self._pending[key] = (current, now)
-                    continue
-                # Another error, such as a read-only archive, still allows transcription if it is readable.
-                try:
-                    with open(path, "rb"):
-                        pass
-                except OSError:
-                    with self._lock:
-                        self._pending[key] = (current, now)
-                    continue
+            if not released:
+                with self._lock:
+                    self._pending[key] = (current, now)
+                continue
             with self._lock:
                 self._pending.pop(key, None)
             if current >= self.settings.min_file_size_kb * 1024:

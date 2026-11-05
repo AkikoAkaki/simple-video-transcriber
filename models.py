@@ -1,18 +1,26 @@
-"""Load and reuse the Whisper and pyannote models, keeping at most one of them resident."""
+"""Load the recognition and diarization models once and keep them resident across a job queue."""
 
 from __future__ import annotations
 
 import contextlib
 import functools
 import gc
+import math
 import os
 import sys
+import threading
+import types
 from pathlib import Path
-
-import config
 
 
 DIARIZATION_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
+# English speech on the GPU goes to Parakeet; on lectures it keeps Whisper's content at 2.5x the speed.
+PARAKEET_LABEL = "Parakeet TDT 0.6B v3"
+_PARAKEET_REPO = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+_PARAKEET_FILES = ("config.json", "vocab.txt", "nemo128.onnx", "encoder-model.onnx",
+                   "encoder-model.onnx.data", "decoder_joint-model.onnx")
+# A small multilingual Whisper decides which recognizer an auto-detect job uses.
+LANGUAGE_ID_MODEL = "base"
 
 
 def compute_type(device: str) -> str:
@@ -82,8 +90,7 @@ def _load_cuda_libraries():
     _CUDA_DLL_HANDLES.extend(handles)
 
 
-def resolve_device(device: str | None = None) -> str:
-    device = device or config.DEVICE
+def resolve_device(device: str) -> str:
     if device != "cpu":
         _load_cuda_libraries()
     if device == "auto":
@@ -105,7 +112,33 @@ def resolve_device(device: str | None = None) -> str:
 
 def _load_whisper(model_name: str, device: str):
     from faster_whisper import WhisperModel
-    return WhisperModel(model_name, device=device, compute_type=compute_type(device))
+    from faster_whisper.utils import download_model
+    if device == "cuda":
+        _load_cuda_libraries()
+    try:
+        # A downloaded model loads without the HuggingFace update check, which costs about 2s per load.
+        model_path = download_model(model_name, local_files_only=True)
+    except Exception:
+        model_path = model_name
+    return WhisperModel(model_path, device=device, compute_type=compute_type(device))
+
+
+def _load_parakeet():
+    """Parakeet through onnx-asr on CUDA, returning token timestamps."""
+    import onnx_asr
+    import onnxruntime
+    from huggingface_hub import snapshot_download
+
+    from appdata import APP_DATA_DIR
+    # A plain folder: onnxruntime rejects external weights reached through HuggingFace cache links.
+    folder = APP_DATA_DIR / "models" / "parakeet-tdt-0.6b-v3"
+    if not all((folder / name).is_file() for name in _PARAKEET_FILES):
+        snapshot_download(_PARAKEET_REPO, allow_patterns=list(_PARAKEET_FILES), local_dir=folder)
+    _load_cuda_libraries()
+    # Hide per-node placement warnings; onnxruntime deliberately keeps shape ops on the CPU.
+    onnxruntime.set_default_logger_severity(3)
+    model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", folder, providers=["CUDAExecutionProvider"])
+    return model.with_timestamps()
 
 
 def _load_diarization(token: str, device: str):
@@ -122,51 +155,123 @@ def _load_diarization(token: str, device: str):
         print(f"      GPU move failed ({exc}), falling back to CPU", flush=True)
         device = "cpu"
         pipeline.to(torch.device(device))
+    pipeline.get_embeddings = types.MethodType(_embed_active_speakers, pipeline)
+    if device == "cuda":
+        _half_precision_embeddings(pipeline)
     return pipeline, device
 
 
-_whisper = None  # ((model_name, device), model)
-_diarization = None  # ((token, requested device), pipeline, device it runs on)
+def _embed_active_speakers(self, file, binary_segmentations, exclude_overlap=False, hook=None):
+    """pyannote 3.x get_embeddings without the (chunk, speaker) pairs whose mask is empty.
+
+    pyannote embeds every local speaker slot of every chunk, then clustering drops the empty ones
+    and marks them inactive. Skipping them leaves the speaker turns unchanged at about half the cost.
+    """
+    import numpy as np
+    import torch
+    duration = binary_segmentations.sliding_window.duration
+    num_chunks, num_frames, num_speakers = binary_segmentations.data.shape
+    if exclude_overlap:
+        num_samples = duration * self._embedding.sample_rate
+        min_num_frames = math.ceil(num_frames * self._embedding.min_num_samples / num_samples)
+        clean = binary_segmentations.data * (np.sum(binary_segmentations.data, axis=2, keepdims=True) < 2)
+    else:
+        min_num_frames, clean = -1, binary_segmentations.data
+    embeddings = np.full((num_chunks * num_speakers, self._embedding.dimension), np.nan, dtype=np.float32)
+    rows, waveforms, masks = [], [], []
+
+    def flush():
+        if rows:
+            embeddings[rows] = self._embedding(torch.vstack(waveforms), masks=torch.vstack(masks))
+            rows.clear()
+            waveforms.clear()
+            masks.clear()
+
+    for c, (chunk, chunk_masks) in enumerate(binary_segmentations):
+        chunk_masks = np.nan_to_num(chunk_masks, nan=0.0).astype(np.float32)
+        clean_masks = np.nan_to_num(clean[c], nan=0.0).astype(np.float32)
+        active = [s for s in range(num_speakers) if chunk_masks[:, s].sum() > 0]
+        if not active:
+            continue
+        waveform, _ = self._audio.crop(file, chunk, duration=duration, mode="pad")
+        for s in active:
+            mask = clean_masks[:, s] if clean_masks[:, s].sum() > min_num_frames else chunk_masks[:, s]
+            rows.append(c * num_speakers + s)
+            waveforms.append(waveform[None])
+            masks.append(torch.from_numpy(mask)[None])
+            if len(rows) >= self.embedding_batch_size:
+                flush()
+    flush()
+    return embeddings.reshape(num_chunks, num_speakers, -1)
+
+
+def _half_precision_embeddings(pipeline) -> None:
+    """Run the speaker-embedding ResNet in float16; filterbank features stay float32 to avoid overflow."""
+    import torch
+    resnet = pipeline._embedding.model_.resnet
+    resnet.to(memory_format=torch.channels_last)
+    forward = resnet.forward
+
+    @functools.wraps(forward)
+    def half_forward(*args, **kwargs):
+        with torch.autocast("cuda", dtype=torch.float16):
+            result = forward(*args, **kwargs)
+        return tuple(x.float() for x in result) if isinstance(result, tuple) else result.float()
+
+    resnet.forward = half_forward
+
+
+class _Resident:
+    """One model kept loaded between jobs, reloaded when its parameters change.
+
+    A preload thread and a job stage can ask for the same model; the second caller waits for the
+    first load instead of loading it again.
+    """
+
+    def __init__(self, load):
+        self._load = load
+        self._lock = threading.RLock()
+        self._entry = None  # (params, model)
+
+    def get(self, *params):
+        with self._lock:
+            if self._entry is None or self._entry[0] != params:
+                self.release()
+                self._entry = (params, self._load(*params))
+            return self._entry[1]
+
+    def release(self) -> None:
+        with self._lock:
+            if self._entry is not None:
+                self._entry = None
+                gc.collect()
+                empty_cuda_cache()
+
+
+# The loaders are looked up at call time so tests can replace them.
+_whisper = _Resident(lambda model_name, device: _load_whisper(model_name, device))
+_language_id = _Resident(lambda device: _load_whisper(LANGUAGE_ID_MODEL, device))
+_parakeet = _Resident(lambda: _load_parakeet())
+_diarization = _Resident(lambda token, device: _load_diarization(token, device))
 
 
 def get_whisper_model(model_name: str, device: str):
-    global _whisper
-    release_diarize_pipeline()
-    params = (model_name, device)
-    if _whisper is None or _whisper[0] != params:
-        release_whisper_model()
-        if device == "cuda":
-            _load_cuda_libraries()
-        _whisper = (params, _load_whisper(model_name, device))
-    return _whisper[1]
+    return _whisper.get(model_name, device)
+
+
+def get_language_id_model(device: str):
+    return _language_id.get(device)
+
+
+def get_parakeet_model():
+    return _parakeet.get()
 
 
 def get_diarize_pipeline(token: str, device: str):
     """Return the pipeline and the device it runs on."""
-    global _diarization
-    release_whisper_model()
-    params = (token, device)
-    if _diarization is None or _diarization[0] != params:
-        release_diarize_pipeline()
-        _diarization = (params, *_load_diarization(token, device))
-    return _diarization[1], _diarization[2]
-
-
-def release_whisper_model() -> None:
-    global _whisper
-    if _whisper is not None:
-        _whisper = None
-        gc.collect()
-        empty_cuda_cache()
-
-
-def release_diarize_pipeline() -> None:
-    global _diarization
-    if _diarization is not None:
-        _diarization = None
-        empty_cuda_cache()
+    return _diarization.get(token, device)
 
 
 def release_models() -> None:
-    release_whisper_model()
-    release_diarize_pipeline()
+    for model in (_whisper, _language_id, _parakeet, _diarization):
+        model.release()

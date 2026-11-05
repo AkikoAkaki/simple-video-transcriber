@@ -1,0 +1,9 @@
+{
+  "id": "meeting-transcriber",
+  "name": "Meeting Transcriber",
+  "version": "0.1.0",
+  "minAppVersion": "1.8.0",
+  "description": "Task panel for the local Meeting Transcriber: queue recordings, follow progress, and hand finished transcripts to your organizing workflow.",
+  "author": "Aki Liu",
+  "isDesktopOnly": true
+}

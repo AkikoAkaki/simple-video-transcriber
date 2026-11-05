@@ -1,8 +1,6 @@
-"""Background service for Simple Video Transcriber.
+"""The always-on core behind the tray: watch folder, durable job state, and the serial worker queue.
 
-This module intentionally contains no Qt imports.  It is the small, always-on
-part of the application: it watches the OBS directory, persists job state, and
-starts the heavy transcription process only when a file is ready.
+It imports no Qt, so the API and tests drive it directly.
 """
 
 from __future__ import annotations
@@ -26,8 +24,6 @@ from worker import WorkerController
 
 
 class BackgroundService:
-    """Coordinates watcher, durable state, and the serial worker queue."""
-
     def __init__(self, settings: AppSettings | None = None,
                  on_event: Callable[[str, dict], None] | None = None):
         self.settings = settings or AppSettings.load()
@@ -37,19 +33,18 @@ class BackgroundService:
         self._log_lock = threading.Lock()
         self._log_count = 0
         self.worker = WorkerController(self.settings, self.store, self.token_store, self._event)
-        self.watcher = FileWatcher(self.settings, lambda path: self.add_file(path, from_watcher=True), self._event)
-        self._started = False
+        self.watcher = FileWatcher(self.settings, self._recording_ready, self._event)
+        # Finished recordings from the watch folder wait here until the user chooses to transcribe them.
+        self._offers: dict[str, Path] = {}
+        self._offers_lock = threading.Lock()
 
     def start(self) -> None:
-        if self._started:
-            return
         self.store.recover_interrupted()
         self.worker.start()
         if self.settings.watcher_enabled:
             self.watcher.start()
         else:
             self._event("watch_stopped", {"message": "Watcher paused"})
-        self._started = True
         for row in self.store.queued():
             self.worker.enqueue(row)
         self._event("service_started", {"message": "Background service started"})
@@ -57,7 +52,6 @@ class BackgroundService:
     def stop(self) -> None:
         self.watcher.stop()
         self.worker.stop()
-        self._started = False
 
     def set_watcher_enabled(self, enabled: bool) -> None:
         self.settings.watcher_enabled = enabled
@@ -76,13 +70,51 @@ class BackgroundService:
         if was_enabled:
             self.watcher.start()
 
-    def update_settings(self, **changes) -> None:
-        for name, value in changes.items():
-            setattr(self.settings, name, value)
-        self.settings.save()
-
     def add_file(self, path: Path, overrides: dict | None = None, *, from_watcher: bool = False) -> dict | None:
         return self._enqueue(path, replace(self.settings.job_options(), **(overrides or {})), from_watcher)
+
+    def add_files(self, paths) -> list[dict]:
+        """Queue each audio or video file once; folders, other files, and repeats are skipped."""
+        rows, seen = [], set()
+        for path in map(Path, paths):
+            if path.suffix.lower() not in config.WATCH_EXTENSIONS or not path.is_file():
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            with self._offers_lock:
+                self._offers.pop(key, None)
+            row = self.add_file(path)
+            if row:
+                rows.append(row)
+        return rows
+
+    def _recording_ready(self, path: Path) -> None:
+        """Offer a finished recording instead of queueing it: most OBS recordings need no transcript."""
+        if self.store.knows(path):
+            return
+        key = str(path.resolve())
+        with self._offers_lock:
+            if key in self._offers:
+                return
+            self._offers[key] = path
+        self._event("recording_ready", {"path": key, "message": f"New recording: {path.name}"})
+
+    def offered_recordings(self) -> list[str]:
+        with self._offers_lock:
+            return list(self._offers)
+
+    def accept_recording(self, path: str) -> dict | None:
+        with self._offers_lock:
+            recording = self._offers.pop(path, None)
+        if recording is None:
+            raise ValueError("This recording is no longer waiting for a decision.")
+        return self._enqueue(recording, self.settings.job_options(), from_watcher=True)
+
+    def dismiss_recording(self, path: str) -> None:
+        with self._offers_lock:
+            self._offers.pop(path, None)
 
     def retry_job(self, job_id: str) -> dict | None:
         row = self.store.get(job_id)
@@ -112,9 +144,6 @@ class BackgroundService:
 
     def recent_jobs(self, limit: int = 20) -> list[dict]:
         return self.store.recent(limit)
-
-    def get_token(self) -> str:
-        return self.token_store.get()
 
     def set_token(self, token: str) -> None:
         self.token_store.set(token)

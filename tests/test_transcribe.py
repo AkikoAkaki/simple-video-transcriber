@@ -7,6 +7,7 @@ import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import models
@@ -121,6 +122,7 @@ def _stub_job_audio(tmp_path, monkeypatch):
     monkeypatch.setattr(transcribe.config, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(transcribe.config, "TRANSCRIPT_DIR", tmp_path / "transcripts")
     monkeypatch.setattr(transcribe, "convert_to_wav", lambda *_: None)
+    monkeypatch.setattr(transcribe, "decode_audio", lambda _: np.zeros(32000, dtype=np.float32))
     monkeypatch.setattr(transcribe, "get_wav_duration", lambda _: 2.0)
     monkeypatch.setattr(transcribe, "resolve_device", lambda *args: "cpu")
     monkeypatch.setattr(models, "_load_whisper", lambda *_: FakeWhisper())
@@ -150,7 +152,7 @@ def test_cached_job_skips_audio_and_models_and_keeps_globals(tmp_path, monkeypat
     source.write_bytes(b"source")
     monkeypatch.setattr(transcribe.config, "CACHE_DIR", tmp_path / "cache")
     paths = transcribe.prepare_paths(source, tmp_path / "out")
-    key = transcribe._whisper_cache_key("large-v3", "cpu", "en", "", True)
+    key = transcribe._whisper_cache_key("large-v3", "cpu", "en", "")
     transcribe._write_stage_cache(paths.whisper_json, "whisper", key,
         [{"start": 0.0, "end": 2.0, "text": "Lecture content."}], metadata={"total_sec": 5.0})
     transcribe._write_stage_cache(paths.diarize_json, "diarization",
@@ -243,24 +245,34 @@ def test_diarization_failure_keeps_transcript_and_recognition_cache(tmp_path, mo
     assert not paths.diarize_json.exists()
 
 
-def test_batch_releases_models_before_loading_next_stage(tmp_path, monkeypatch):
-    _stub_job_audio(tmp_path, monkeypatch)
+def test_out_of_memory_stage_releases_resident_models_then_retries(tmp_path, monkeypatch):
+    source = _stub_job_audio(tmp_path, monkeypatch)
     resident = weakref.WeakSet()
+    whisper_loads = []
 
-    def loader(make, *placement):
-        def load(*args):
-            gc.collect()
-            assert not resident, "Previous model still occupies memory"
-            model = make()
-            resident.add(model)
-            return (model, *placement) if placement else model
-        return load
+    class Whisper(FakeWhisper):
+        def transcribe(self, *args, **kwargs):
+            if len(whisper_loads) == 1:
+                raise RuntimeError("CUDA failed with error out of memory")
+            return super().transcribe(*args, **kwargs)
 
-    monkeypatch.setattr(models, "_load_whisper", loader(FakeWhisper))
-    monkeypatch.setattr(models, "_load_diarization", loader(FakePipeline, "cpu"))
-    for name in ("first.m4a", "second.m4a"):
-        source = tmp_path / name
-        source.write_bytes(b"audio")
-        transcribe.run_job_from_json({"input_path": str(source), "device": "cpu",
-                                     "output_dir": str(tmp_path / "transcripts"), "token": "test-token"})
-        assert "Lecture content." in transcribe.prepare_paths(source).output_md.read_text(encoding="utf-8")
+    def load_whisper(*args):
+        gc.collect()
+        assert not whisper_loads or not resident, "Retry started while earlier models still occupy memory"
+        whisper_loads.append(None)
+        model = Whisper()
+        resident.add(model)
+        return model
+
+    def load_pipeline(*args):
+        pipeline = FakePipeline()
+        resident.add(pipeline)
+        return pipeline, "cpu"
+
+    monkeypatch.setattr(models, "_load_whisper", load_whisper)
+    monkeypatch.setattr(models, "_load_diarization", load_pipeline)
+    transcribe.run_job_from_json({"input_path": str(source), "device": "cpu",
+                                 "output_dir": str(tmp_path / "transcripts"), "token": "test-token"})
+    text = transcribe.prepare_paths(source).output_md.read_text(encoding="utf-8")
+    assert "Lecture content." in text and "SPEAKER_00" in text
+    assert len(whisper_loads) == 2

@@ -39,9 +39,6 @@ class AppSettings:
     min_file_size_kb: int = config.MIN_FILE_SIZE_KB
     watcher_enabled: bool = True
 
-    def __post_init__(self) -> None:
-        self.model = config.normalize_whisper_model(self.model)
-
     @classmethod
     def load(cls, path: Path | None = None) -> AppSettings:
         """Read saved settings; a hand-edited value a job would reject falls back to its default."""
@@ -89,9 +86,7 @@ class TokenStore:
         value = ""
         try:
             import keyring
-            value = keyring.get_password(self.SERVICE, self.USER)
-            if value:
-                value = value.strip()
+            value = (keyring.get_password(self.SERVICE, self.USER) or "").strip()
         except Exception:
             pass
         if not value:

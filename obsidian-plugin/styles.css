@@ -1,0 +1,363 @@
+.mt-view {
+	--mt-ease: cubic-bezier(0.23, 1, 0.32, 1);
+	--mt-raise: color-mix(in srgb, var(--text-normal) 6%, transparent);
+	--mt-raise-2: color-mix(in srgb, var(--text-normal) 11%, transparent);
+	padding: 12px !important;
+	font-size: var(--font-ui-small);
+}
+
+.mt-section:empty {
+	display: none;
+}
+
+.mt-label {
+	margin: 20px 2px 8px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+}
+
+.mt-section:first-child .mt-label,
+.mt-section:empty + .mt-section .mt-label {
+	margin-top: 4px;
+}
+
+/* Cards */
+
+.mt-card {
+	padding: 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 12px;
+	background: var(--background-primary);
+	box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.mt-card + .mt-card {
+	margin-top: 8px;
+}
+
+.mt-top {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.mt-info {
+	flex: 1;
+	min-width: 0;
+}
+
+.mt-name {
+	overflow: hidden;
+	font-weight: var(--font-medium);
+	color: var(--text-normal);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.mt-name.is-light {
+	flex: 1;
+	min-width: 0;
+	font-weight: var(--font-normal);
+}
+
+.mt-sub {
+	overflow: hidden;
+	margin-top: 1px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-muted);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.mt-error {
+	color: var(--text-error);
+}
+
+.mt-mono {
+	font-family: var(--font-monospace);
+	font-size: 11px;
+}
+
+.mt-faint {
+	color: var(--text-faint);
+}
+
+.mt-acts {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	margin-top: 10px;
+	padding-left: 42px;
+}
+
+.mt-empty {
+	padding: 6px 2px;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-faint);
+}
+
+.mt-tile {
+	display: flex;
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	border-radius: 8px;
+	background: var(--mt-raise);
+	color: var(--text-muted);
+}
+
+.mt-tile svg {
+	width: 16px;
+	height: 16px;
+}
+
+.mt-tile.is-bad {
+	background: color-mix(in srgb, var(--color-red) 12%, transparent);
+	color: var(--color-red);
+}
+
+.mt-tile.is-plain {
+	width: 22px;
+	height: 22px;
+	background: transparent;
+}
+
+.mt-tile.is-ok {
+	color: var(--color-green);
+}
+
+.mt-chip {
+	flex: none;
+	height: 20px;
+	padding: 0 7px;
+	border-radius: 6px;
+	background: var(--mt-raise);
+	font-size: 11px;
+	line-height: 20px;
+	color: var(--text-muted);
+	white-space: nowrap;
+}
+
+.mt-chip.is-warn {
+	background: color-mix(in srgb, var(--color-orange) 14%, transparent);
+	color: var(--color-orange);
+}
+
+.mt-chip.is-bad {
+	background: color-mix(in srgb, var(--color-red) 12%, transparent);
+	color: var(--color-red);
+}
+
+/* Running job */
+
+.mt-hero {
+	padding: 14px;
+}
+
+.mt-bar {
+	overflow: hidden;
+	height: 6px;
+	margin-top: 14px;
+	border-radius: 3px;
+	background: var(--mt-raise-2);
+}
+
+.mt-bar-fill {
+	height: 100%;
+	background: var(--text-normal);
+	transform: scaleX(0);
+	transform-origin: left;
+	transition: transform 0.6s var(--mt-ease);
+}
+
+.mt-steps {
+	display: flex;
+	gap: 4px;
+	margin-top: 8px;
+}
+
+.mt-steps span {
+	flex: 1;
+	font-size: 11px;
+	color: var(--text-faint);
+	transition: color 0.2s var(--mt-ease);
+}
+
+.mt-steps span.is-past {
+	color: var(--text-muted);
+}
+
+.mt-steps span.is-now {
+	color: var(--text-normal);
+}
+
+/* Finished rows */
+
+.mt-slim {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 6px 6px 8px;
+	border-color: transparent;
+	background: transparent;
+	box-shadow: none;
+	transition: background-color 0.15s var(--mt-ease);
+}
+
+.mt-card.mt-slim + .mt-card.mt-slim {
+	margin-top: 0;
+}
+
+.mt-slim:hover {
+	background: var(--mt-raise);
+}
+
+.mt-slim .mt-icon-btn {
+	opacity: 0;
+	transition: opacity 0.15s var(--mt-ease), background-color 0.15s var(--mt-ease), color 0.15s var(--mt-ease);
+}
+
+.mt-slim:hover .mt-icon-btn,
+.mt-slim .mt-icon-btn:focus-visible {
+	opacity: 1;
+}
+
+/* Service down */
+
+.mt-down {
+	border-color: color-mix(in srgb, var(--color-red) 30%, var(--background-modifier-border));
+}
+
+/* Buttons */
+
+.mt-view button.mt-btn,
+.mt-view button.mt-icon-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 6px;
+	height: 28px;
+	margin: 0;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 7px;
+	background: var(--background-primary);
+	box-shadow: none;
+	font-size: var(--font-ui-smaller);
+	color: var(--text-normal);
+	cursor: pointer;
+	white-space: nowrap;
+	transition: background-color 0.15s var(--mt-ease), color 0.15s var(--mt-ease), transform 0.12s var(--mt-ease);
+}
+
+.mt-view button.mt-btn {
+	padding: 0 10px;
+}
+
+.mt-view button.mt-btn:hover {
+	background: var(--mt-raise);
+}
+
+.mt-view button.mt-btn.is-primary {
+	border-color: transparent;
+	background: var(--text-normal);
+	color: var(--background-primary);
+}
+
+.mt-view button.mt-btn.is-primary:hover {
+	background: color-mix(in srgb, var(--text-normal) 85%, var(--background-primary));
+}
+
+.mt-view button.mt-btn.is-ghost {
+	border-color: transparent;
+	background: transparent;
+	color: var(--text-muted);
+}
+
+.mt-view button.mt-btn.is-ghost:hover {
+	background: var(--mt-raise);
+	color: var(--text-normal);
+}
+
+.mt-view button.mt-btn.is-done {
+	color: var(--color-green);
+}
+
+.mt-view button.mt-btn.is-primary.is-done {
+	color: var(--background-primary);
+}
+
+.mt-btn-icon {
+	display: flex;
+}
+
+.mt-btn-icon svg {
+	width: 14px;
+	height: 14px;
+}
+
+.mt-view button.mt-icon-btn {
+	flex: none;
+	width: 28px;
+	padding: 0;
+	border-color: transparent;
+	background: transparent;
+	color: var(--text-muted);
+}
+
+.mt-view button.mt-icon-btn:hover {
+	background: var(--mt-raise);
+	color: var(--text-normal);
+}
+
+.mt-view button.mt-icon-btn svg {
+	width: 15px;
+	height: 15px;
+}
+
+.mt-view button.mt-btn:active,
+.mt-view button.mt-icon-btn:active {
+	transform: scale(0.97);
+}
+
+/* Watcher */
+
+.mt-watch {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin-top: 20px;
+	padding: 12px 2px 0;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+/* Motion */
+
+.mt-enter {
+	animation: mt-enter 0.24s var(--mt-ease) both;
+}
+
+@keyframes mt-enter {
+	from {
+		opacity: 0;
+		transform: translateY(6px) scale(0.98);
+	}
+}
+
+.mt-leave {
+	opacity: 0;
+	transform: scale(0.96);
+	transition: opacity 0.16s var(--mt-ease), transform 0.16s var(--mt-ease);
+	pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.mt-view *,
+	.mt-view *::before,
+	.mt-view *::after {
+		animation: none !important;
+		transition: none !important;
+	}
+}
