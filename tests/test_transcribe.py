@@ -152,7 +152,7 @@ def test_cached_job_skips_audio_and_models_and_keeps_globals(tmp_path, monkeypat
     source.write_bytes(b"source")
     monkeypatch.setattr(transcribe.config, "CACHE_DIR", tmp_path / "cache")
     paths = transcribe.prepare_paths(source, tmp_path / "out")
-    key = transcribe._whisper_cache_key("large-v3", "cpu", "en", "", True)
+    key = transcribe._whisper_cache_key("large-v3", "cpu", "en", "")
     transcribe._write_stage_cache(paths.whisper_json, "whisper", key,
         [{"start": 0.0, "end": 2.0, "text": "Lecture content."}], metadata={"total_sec": 5.0})
     transcribe._write_stage_cache(paths.diarize_json, "diarization",

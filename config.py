@@ -1,12 +1,8 @@
-"""
-simple-video-transcriber configuration
-Defaults for the dashboard and CLI; saved dashboard settings take precedence.
-"""
+"""Defaults for the tray and the CLI; settings saved by the tray take precedence."""
 from pathlib import Path
 import os
 
 # ── Directories ──────────────────────────────────────────────────────────────
-# Root of this repo (don't change)
 ROOT_DIR = Path(__file__).parent.resolve()
 
 # OBS recordings are watched by the tray service. Override this on another
@@ -20,20 +16,10 @@ TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
 CACHE_DIR = ROOT_DIR / "cache"
 
 # ── Whisper ───────────────────────────────────────────────────────────────────
-# Model size vs. quality trade-off:
 #   large-v3-turbo       → fast, high accuracy (~1.6 GB, recommended)
 #   large-v3             → best quality, needs ~6 GB VRAM
 WHISPER_MODEL = "large-v3-turbo"
-
-# Single source of truth for supported Whisper models.
 SUPPORTED_MODELS = ("large-v3-turbo", "large-v3")
-
-
-def normalize_whisper_model(value) -> str:
-    """Map legacy/unsupported model names to the default supported model."""
-    if isinstance(value, str) and value in SUPPORTED_MODELS:
-        return value
-    return WHISPER_MODEL
 
 # English speech on an NVIDIA GPU is recognized with Parakeet TDT 0.6B v3 instead
 # of Whisper: about 2.5x faster with the same content on lectures. Auto-detect jobs
@@ -56,7 +42,7 @@ DEVICE = "auto"
 
 # ── Speaker Diarization (pyannote) ───────────────────────────────────────────
 # HuggingFace token — needed to download pyannote models.
-# Leave empty to use the dashboard token store or HF_TOKEN environment variable.
+# Leave empty to use the token saved from the tray or plugin, or the HF_TOKEN environment variable.
 # Get a free token at: https://hf.co/settings/tokens
 # Then accept model terms at:
 #   https://hf.co/pyannote/speaker-diarization-3.1

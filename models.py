@@ -12,8 +12,6 @@ import threading
 import types
 from pathlib import Path
 
-import config
-
 
 DIARIZATION_PIPELINE_ID = "pyannote/speaker-diarization-3.1"
 # English speech on the GPU goes to Parakeet; on lectures it keeps Whisper's content at 2.5x the speed.
@@ -92,8 +90,7 @@ def _load_cuda_libraries():
     _CUDA_DLL_HANDLES.extend(handles)
 
 
-def resolve_device(device: str | None = None) -> str:
-    device = device or config.DEVICE
+def resolve_device(device: str) -> str:
     if device != "cpu":
         _load_cuda_libraries()
     if device == "auto":

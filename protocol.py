@@ -24,9 +24,6 @@ STAGE_STEPS = {
 STAGE_COUNT = max(STAGE_STEPS.values())
 _ERROR_MARKERS = ("error", "traceback", "could not load", "cannot load", "invalid handle", "fatal")
 
-# Pipeline labels stored by older dashboards in place of ``mode``; any other label ran the full pipeline.
-_LEGACY_MODES = {"Transcribe only": "transcribe", "Re-diarize only": "diarize"}
-
 
 def looks_like_error(line: str) -> bool:
     lower = line.lower()
@@ -74,13 +71,11 @@ class JobOptions:
 
     @classmethod
     def parse(cls, data: dict, base: JobOptions | None = None) -> JobOptions:
-        """Build options from worker JSON, CLI values or a row saved by an older version.
+        """Build options from worker JSON, CLI values or a saved row.
 
         Missing fields come from ``base``; "auto" means "let the model decide".
         """
         values = {f.name: data[f.name] for f in fields(cls) if f.name in data}
-        if "mode" not in values and "pipeline" in data:
-            values["mode"] = _LEGACY_MODES.get(data["pipeline"], "full")
         for name in ("language", "max_speakers", "num_speakers"):
             if name in values and str(values[name]).strip().lower() in {"", "auto", "none"}:
                 values[name] = None

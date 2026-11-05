@@ -52,34 +52,18 @@ def snapshot(service) -> dict:
 
 
 def _routes(service) -> dict:
-    def queue(body):
-        return {"queued": [row["job_id"] for row in service.add_files(body.get("paths") or [])]}
-
-    def retry(body, job_id):
-        row = service.retry_job(job_id)
-        return {"queued": [row["job_id"]] if row else []}
-
-    def accept(body):
-        row = service.accept_recording(str(body.get("path", "")))
-        return {"queued": [row["job_id"]] if row else []}
-
-    def watcher(body):
-        service.set_watcher_enabled(bool(body.get("enabled")))
-        return snapshot(service)
-
-    def token(body):
-        service.set_token(str(body.get("token", "")).strip())
-        return {}
+    def queued(*rows):
+        return {"queued": [row["job_id"] for row in rows if row]}
 
     return {
         ("GET", r"/api/state"): lambda body: snapshot(service),
-        ("POST", r"/api/jobs"): queue,
-        ("POST", r"/api/jobs/([\w-]+)/retry"): retry,
+        ("POST", r"/api/jobs"): lambda body: queued(*service.add_files(body.get("paths") or [])),
+        ("POST", r"/api/jobs/([\w-]+)/retry"): lambda body, job_id: queued(service.retry_job(job_id)),
         ("POST", r"/api/cancel"): lambda body: service.cancel_active() or {},
-        ("POST", r"/api/recordings/accept"): accept,
+        ("POST", r"/api/recordings/accept"): lambda body: queued(service.accept_recording(str(body.get("path", "")))),
         ("POST", r"/api/recordings/dismiss"): lambda body: service.dismiss_recording(str(body.get("path", ""))) or {},
-        ("POST", r"/api/watcher"): watcher,
-        ("POST", r"/api/token"): token,
+        ("POST", r"/api/watcher"): lambda body: service.set_watcher_enabled(bool(body.get("enabled"))) or snapshot(service),
+        ("POST", r"/api/token"): lambda body: service.set_token(str(body.get("token", ""))) or {},
     }
 
 

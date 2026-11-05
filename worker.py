@@ -199,7 +199,7 @@ class WorkerController:
 
     def _run_one_server(self, row: dict) -> None:
         job_id = row["job_id"]
-        job = self.store.get(job_id) or row
+        job = self.store.get(job_id)
         options = job_options(job, self.settings.job_options())
         out_dir = Path(self.settings.transcript_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)

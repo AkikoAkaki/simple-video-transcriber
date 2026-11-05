@@ -41,7 +41,7 @@ if (-not (Test-Path $pythonw)) {
 }
 
 # 3. Register in HKCU Run key
-$cmd = "`"$pythonw`" `"$script`" --tray-only"
+$cmd = "`"$pythonw`" `"$script`""
 Set-ItemProperty -Path $regPath -Name $regName -Value $cmd
 
 Write-Host ""
@@ -55,11 +55,11 @@ Write-Host "     (Runs via Explorer desktop session, immune to laptop battery po
 Write-Host ""
 
 if ($StartNow) {
-    Start-Process -FilePath $pythonw -ArgumentList "`"$script`" --tray-only" -WindowStyle Hidden
+    Start-Process -FilePath $pythonw -ArgumentList "`"$script`"" -WindowStyle Hidden
     Write-Host "[OK] Launched SimpleVideoTranscriber in the background."
 } else {
     Write-Host "To launch right now, run:"
-    Write-Host "  Start-Process -FilePath '$pythonw' -ArgumentList '`"$script`" --tray-only' -WindowStyle Hidden"
+    Write-Host "  Start-Process -FilePath '$pythonw' -ArgumentList '`"$script`"' -WindowStyle Hidden"
 }
 Write-Host "To uninstall autostart, run:"
 Write-Host "  powershell -ExecutionPolicy Bypass -File setup_autostart.ps1 -Uninstall"

@@ -179,7 +179,7 @@ class TrayApp(QObject):
             path = payload["path"]
             self._notify("发现新录屏", f"{name}\n点击开始转录", lambda: self._accept(path))
         elif event in ("completed", "completed_with_warning"):
-            self._notify("转录完成", f"{name or payload.get('message', '')}\n点击在 Obsidian 中归档",
+            self._notify("转录完成", f"{name or payload.get('message', '')}\n点击打开任务面板",
                          lambda: _open(PANEL_URI))
         elif event == "failed":
             self._notify("转录失败", payload.get("error") or payload.get("message", ""), lambda: _open(PANEL_URI),

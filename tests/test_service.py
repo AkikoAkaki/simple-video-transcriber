@@ -166,7 +166,8 @@ def test_worker_never_claims_false_success(svc, tmp_path, monkeypatch, outcome):
 
 
 def test_service_state_stays_in_current_app_data(svc, tmp_path):
-    svc.update_settings(language="ja")
+    svc.settings.language = "ja"
+    svc.settings.save()
     saved = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert saved["transcript_dir"] == str(tmp_path / "transcripts")
     assert appdata.AppSettings.load().language == "ja"

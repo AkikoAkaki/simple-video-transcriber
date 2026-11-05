@@ -91,9 +91,6 @@ class JobStore:
                 CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at DESC);
                 """
             )
-            columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
-            if "options_json" not in columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN options_json TEXT DEFAULT '{}'")
 
     def create_if_new(self, path: Path, options: JobOptions = JobOptions(), *,
                       from_watcher: bool = False) -> dict | None:
@@ -102,63 +99,33 @@ class JobStore:
         except OSError:
             return None
         stamp = now()
-        options_json = json.dumps(asdict(options), ensure_ascii=False)
+        # A queued job starts from this state, whether it is new or a re-run of a finished one.
+        fresh = {"status": JobStatus.QUEUED, "stage": JobStatus.QUEUED, "progress": 0.0, "message": "Queued",
+                 "output_path": "", "error": "", "updated_at": stamp, "started_at": "", "finished_at": "",
+                 "retry_count": 0, "options_json": json.dumps(asdict(options), ensure_ascii=False)}
         with self._connect() as conn:
             existing = conn.execute("SELECT * FROM jobs WHERE source_key = ?", (source.key,)).fetchone()
             if existing:
-                if existing["status"] in ACTIVE:
+                # A stray filesystem event must never re-queue hours of GPU
+                # work and wipe the result pointer; re-runs are retries or imports.
+                if existing["status"] in ACTIVE or from_watcher:
                     return None
-                if from_watcher:
-                    # A stray filesystem event must never re-queue hours of GPU
-                    # work and wipe the result pointer; re-runs are retries or imports.
-                    return None
-                job_id = existing["job_id"]
-                conn.execute(
-                    "UPDATE jobs SET status=?, stage=?, progress=0.0, message='Queued', "
-                    "output_path='', error='', started_at='', finished_at='', updated_at=?, options_json=?, "
-                    "retry_count=0 WHERE job_id = ?",
-                    (JobStatus.QUEUED, JobStatus.QUEUED, stamp, options_json, job_id)
-                )
-                row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
-                return dict(row) if row else None
-
-            job_id = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-            row = {
-                "job_id": job_id,
-                "source_path": source.path,
-                "source_key": source.key,
-                "source_size": source.size,
-                "source_mtime_ns": source.mtime_ns,
-                "status": JobStatus.QUEUED,
-                "stage": JobStatus.QUEUED,
-                "progress": 0.0,
-                "message": "Queued",
-                "output_path": "",
-                "error": "",
-                "created_at": stamp,
-                "updated_at": stamp,
-                "started_at": "",
-                "finished_at": "",
-                "retry_count": 0,
-                "options_json": options_json,
-            }
+                row = {**dict(existing), **fresh}
+                conn.execute(f"UPDATE jobs SET {', '.join(f'{key} = ?' for key in fresh)} WHERE job_id = ?",
+                             (*fresh.values(), row["job_id"]))
+                return row
+            row = {"job_id": datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6],
+                   "source_path": source.path, "source_key": source.key, "source_size": source.size,
+                   "source_mtime_ns": source.mtime_ns, "created_at": stamp, **fresh}
             try:
-                conn.execute(
-                    "INSERT INTO jobs ({}) VALUES ({})".format(
-                        ",".join(row), ",".join("?" for _ in row)
-                    ),
-                    tuple(row.values()),
-                )
+                conn.execute(f"INSERT INTO jobs ({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+                             tuple(row.values()))
             except sqlite3.IntegrityError:
                 return None
         return row
 
-    def update(self, job_id: str, **changes) -> dict | None:
-        changes["updated_at"] = now()
-        assignments = ", ".join(f"{key} = ?" for key in changes)
-        with self._connect() as conn:
-            conn.execute(f"UPDATE jobs SET {assignments} WHERE job_id = ?", (*changes.values(), job_id))
-        return self.get(job_id)
+    def update(self, job_id: str, **changes) -> bool:
+        return self._transition(job_id, JobStatus, **changes)
 
     def start(self, job_id: str) -> bool:
         return self._transition(job_id, {JobStatus.QUEUED}, status=JobStatus.RUNNING, stage="starting",
@@ -225,7 +192,7 @@ class JobStore:
             rows = conn.execute("SELECT source_path, source_key, status FROM jobs").fetchall()
         return [tuple(row) for row in rows]
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self) -> None:
         stamp = now()
         with self._connect() as conn:
             conn.execute(
@@ -239,12 +206,11 @@ class JobStore:
                 (JobStatus.FAILED, f"Failed after {MAX_RECOVERIES} recovery retries",
                  stamp, stamp, JobStatus.RUNNING, MAX_RECOVERIES),
             )
-            cur = conn.execute(
+            conn.execute(
                 "UPDATE jobs SET status=?, stage=?, message='Recovered after restart', "
                 "updated_at=?, retry_count=retry_count+1 WHERE status=? AND retry_count < ?",
                 (JobStatus.QUEUED, JobStatus.QUEUED, stamp, JobStatus.RUNNING, MAX_RECOVERIES),
             )
-        return cur.rowcount
 
 
 def cache_size_bytes(cache_dir: Path) -> int:

@@ -74,34 +74,20 @@ def _join_blocks(run: dict, item: dict) -> str:
 def _coalesce_short_speaker_runs(segments: list[dict], max_duration: float = 1.0) -> list[dict]:
     """Suppress only high-confidence, short diarization flicker.
 
-    A short unknown block is reassigned only when its known neighbours agree.
-    A known speaker block is reassigned under the same condition only when its
-    displayed text is at most four non-space characters. Boundary unknown
-    blocks may borrow their single known neighbour. All other changes remain
-    untouched so real speaker switches are preserved.
+    A short block takes its neighbours' speaker when every neighbour it has
+    names the same known speaker. An unknown block needs one such neighbour;
+    a known block needs two and at most four non-space characters of text.
+    Real speaker switches are preserved.
     """
     work = [dict(segment) for segment in segments]
     for index, segment in enumerate(work):
         if segment["end"] - segment["start"] > max_duration:
             continue
-        previous = work[index - 1] if index > 0 else None
-        following = work[index + 1] if index + 1 < len(work) else None
-        previous_speaker = previous["speaker"] if previous else None
-        following_speaker = following["speaker"] if following else None
-        compact_chars = len("".join(segment["text"].split()))
-
-        if segment["speaker"] == UNKNOWN_SPEAKER:
-            if previous_speaker and previous_speaker == following_speaker and previous_speaker != UNKNOWN_SPEAKER:
-                segment["speaker"] = previous_speaker
-            elif previous_speaker and not following and previous_speaker != UNKNOWN_SPEAKER:
-                segment["speaker"] = previous_speaker
-            elif following_speaker and not previous and following_speaker != UNKNOWN_SPEAKER:
-                segment["speaker"] = following_speaker
-        elif (compact_chars <= 4 and previous_speaker and
-              previous_speaker == following_speaker and
-              previous_speaker != segment["speaker"] and
-              previous_speaker != UNKNOWN_SPEAKER):
-            segment["speaker"] = previous_speaker
+        sides = [work[i]["speaker"] for i in (index - 1, index + 1) if 0 <= i < len(work)]
+        if len(set(sides)) != 1 or sides[0] == UNKNOWN_SPEAKER:
+            continue
+        if segment["speaker"] == UNKNOWN_SPEAKER or (len(sides) == 2 and len("".join(segment["text"].split())) <= 4):
+            segment["speaker"] = sides[0]
     return _merge_runs(work, _join_blocks)
 
 

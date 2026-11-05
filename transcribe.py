@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-simple-video-transcriber — transcribe.py
-Transcribe a video or audio file with speaker labels.
+"""Transcribe a video or audio file with speaker labels.
 
 Usage:
   python transcribe.py <video>                    # full pipeline
@@ -16,27 +14,24 @@ import argparse
 import contextlib
 import hashlib
 import json
+import logging
 import os
-import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
+import warnings
+import wave
 from pathlib import Path
 
-# Force UTF-8 stdout so Unicode characters (checkmarks, arrows, em-dashes)
-# don't crash on Windows systems with GBK/CP936 console encoding.
+# A GBK console must not crash on the checkmarks and arrows in progress lines.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import logging
-import threading
-import time
-import warnings
-
-# Suppress verbose/cosmetic warnings from pyannote and huggingface_hub
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("pyannote").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", message=".*TensorFloat-32.*")
@@ -116,10 +111,9 @@ def select_initial_prompt(language: str | None) -> str | None:
 
 
 def _whisper_cache_key(model_name: str, device: str, language: str | None,
-                       hotwords: str | None, word_timestamps: bool, recognizer: str = "whisper") -> str:
+                       hotwords: str | None, recognizer: str = "whisper") -> str:
     params = dict(model=model_name, device=device, compute_type=compute_type(device),
-                  language=language or "auto", hotwords=hotwords or "",
-                  word_timestamps=bool(word_timestamps),
+                  language=language or "auto", hotwords=hotwords or "", word_timestamps=True,
                   initial_prompt=select_initial_prompt(language) or "")
     if recognizer != "whisper":
         # An auto-detect job picks its recognizer from the audio, so the key records the rule.
@@ -195,45 +189,11 @@ def _heartbeat(stage: str, message: str, interval: float = 10.0):
 
 
 def get_wav_duration(wav_path: Path) -> float:
-    """Read WAV file header directly to calculate duration without loading torchaudio."""
     try:
-        with open(wav_path, "rb") as f:
-            riff_header = f.read(12)
-            if riff_header[:4] != b"RIFF" or riff_header[8:12] != b"WAVE":
-                return 0.0
-
-            sample_rate = 16000
-            channels = 1
-            bits_per_sample = 16
-            data_size = 0
-
-            while True:
-                chunk_header = f.read(8)
-                if len(chunk_header) < 8:
-                    break
-                chunk_id = chunk_header[:4]
-                chunk_len = struct.unpack("<I", chunk_header[4:8])[0]
-
-                if chunk_id == b"fmt ":
-                    fmt_data = f.read(chunk_len)
-                    if len(fmt_data) >= 16:
-                        channels = struct.unpack("<H", fmt_data[2:4])[0]
-                        sample_rate = struct.unpack("<I", fmt_data[4:8])[0]
-                        bits_per_sample = struct.unpack("<H", fmt_data[14:16])[0]
-                    if chunk_len & 1:
-                        f.seek(1, 1)
-                elif chunk_id == b"data":
-                    data_size = chunk_len
-                    break
-                else:
-                    f.seek(chunk_len + (chunk_len & 1), 1)
-
-            bytes_per_second = sample_rate * channels * (bits_per_sample // 8)
-            if bytes_per_second > 0:
-                return data_size / bytes_per_second
-    except (OSError, struct.error):
-        pass
-    return 0.0
+        with wave.open(str(wav_path)) as wav:
+            return wav.getnframes() / wav.getframerate()
+    except (OSError, EOFError, wave.Error, ZeroDivisionError):
+        return 0.0
 
 
 def decode_audio(wav_path: Path):
@@ -346,36 +306,26 @@ def run_whisper(audio: SharedAudio, language: str | None, hotwords: str, *,
         initial_prompt=select_initial_prompt(language),
     )
 
+    duration = info.duration
     last_progress = -1.0
     last_progress_emit = 0.0
     for s in seg_iter:
-        if not s.text.strip():
+        text = s.text.strip()
+        if not text:
             continue
-        segment = {"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()}
-        words = []
-        for word in getattr(s, "words", None) or []:
-            word_text = str(getattr(word, "word", ""))
-            word_start = getattr(word, "start", None)
-            word_end = getattr(word, "end", None)
-            if word_text.strip() and word_start is not None and word_end is not None:
-                words.append({
-                    "start": round(float(word_start), 2),
-                    "end": round(float(word_end), 2),
-                    "word": word_text,
-                })
+        segment = {"start": round(s.start, 2), "end": round(s.end, 2), "text": text}
+        words = [{"start": round(float(w.start), 2), "end": round(float(w.end), 2), "word": w.word}
+                 for w in s.words or () if w.word.strip()]
         if words:
             segment["words"] = words
         segments.append(segment)
-        duration = getattr(info, "duration", None)
-        progress = None
-        if duration and duration > 0:
-            progress = min(max(float(s.end) / float(duration), 0.0), 0.99)
+        progress = min(max(float(s.end) / float(duration), 0.0), 0.99) if duration and duration > 0 else None
         now = time.monotonic()
         if (progress is not None and progress - last_progress >= 0.01) or now - last_progress_emit >= 1.0 or last_progress < 0:
             _emit_event("progress", stage="transcribing", progress=progress,
                         segments=len(segments), audio_position_sec=round(float(s.end), 2),
                         message=f"Transcribed through {format_time(s.end)}",
-                        preview=s.text.strip())
+                        preview=text)
             last_progress = progress if progress is not None else last_progress
             last_progress_emit = now
         if len(segments) % 20 == 0:
@@ -383,7 +333,7 @@ def run_whisper(audio: SharedAudio, language: str | None, hotwords: str, *,
 
     _report("transcribing", 1.0, f"Transcribed {len(segments)} segments; detected {info.language} "
                                  f"({info.language_probability:.0%})", segments=len(segments))
-    return segments, getattr(info, "duration", None)
+    return segments, duration
 
 
 def identify_language(audio: SharedAudio, device: str) -> tuple[str, float]:
@@ -562,8 +512,7 @@ def _run_job_impl(input_path: Path, paths: JobPaths, options: JobOptions, token:
     device = resolve_device(options.device)
     diarize = options.mode != "transcribe"
     recognizer = choose_recognizer(options.language, options.hotwords, device)
-    whisper_key = _whisper_cache_key(options.model, device, options.language, options.hotwords,
-                                     word_timestamps=True, recognizer=recognizer)
+    whisper_key = _whisper_cache_key(options.model, device, options.language, options.hotwords, recognizer)
     diarization_key = _diarization_cache_key(options.max_speakers, options.num_speakers)
 
     whisper = _read_stage_cache(paths.whisper_json, "whisper", whisper_key)
@@ -646,9 +595,11 @@ def _preload_models(model_name: str, recognizer: str, device: str, token: str, *
     loaders = []
     if recognition and recognizer == "detect":
         loaders.append(lambda: get_language_id_model(device))
-    if recognition and recognizer in ("detect", "parakeet"):
+    # Wait for language detection to avoid retaining an unused Parakeet beside Whisper
+    # and diarization on the GPU.
+    if recognition and recognizer == "parakeet":
         loaders.append(get_parakeet_model)
-    elif recognition:
+    elif recognition and recognizer == "whisper":
         loaders.append(lambda: get_whisper_model(model_name, device))
     if diarization:
         loaders.append(lambda: get_diarize_pipeline(token, device))
