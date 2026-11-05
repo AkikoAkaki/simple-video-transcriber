@@ -1,12 +1,13 @@
-import { existsSync } from "fs";
 import { basename } from "path";
-import { ItemView, Notice, TFile, TFolder, WorkspaceLeaf } from "obsidian";
-import type { Job, ServiceState } from "./api";
-import { moveIntoVault, pickFolder, suggestFolder, transcriptTitle } from "./archive";
+import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { ApiError, type Job, type ServiceState } from "./api";
 import type MeetingTranscriberPlugin from "./main";
 
 export const VIEW_TYPE = "meeting-transcriber-tasks";
 const POLL_MS = 2000;
+const IDLE_POLL_MS = 15000;
+const LEAVE_MS = 160;
+const DONE_LIMIT = 8;
 
 const STATUS: Record<string, string> = {
 	queued: "排队中",
@@ -19,6 +20,28 @@ const STATUS: Record<string, string> = {
 };
 const RETRYABLE = new Set(["failed", "cancelled", "completed_with_warning"]);
 const DONE = new Set(["completed", "completed_with_warning"]);
+const VIDEO = /\.(mp4|mkv|mov|avi|webm|flv)$/i;
+
+/** Each worker stage reports its own 0–1 progress; map it onto one bar for the whole job. */
+const STAGE_SPAN: Record<string, [number, number]> = {
+	queued: [0, 0],
+	starting: [0, 0.02],
+	converting: [0.02, 0.1],
+	loading_whisper: [0.1, 0.12],
+	transcribing: [0.12, 0.85],
+	diarizing: [0.85, 0.9],
+	merging: [0.9, 0.95],
+	writing: [0.95, 1],
+	completed: [1, 1],
+};
+const STEPS = ["转换", "识别 · 分离", "合并写出"];
+const STEP_OF: Record<string, number> = { converting: 0, loading_whisper: 1, transcribing: 1, diarizing: 1, merging: 2, writing: 2, completed: 2 };
+
+function overall(job: Job): number {
+	const span = STAGE_SPAN[job.stage];
+	const p = Math.max(0, Math.min(1, job.progress ?? 0));
+	return span ? span[0] + (span[1] - span[0]) * p : p;
+}
 
 function when(iso: string): string {
 	if (!iso) return "";
@@ -27,13 +50,48 @@ function when(iso: string): string {
 	return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+function icon(parent: HTMLElement, name: string, cls = "mt-tile"): HTMLElement {
+	const el = parent.createSpan({ cls });
+	setIcon(el, name);
+	return el;
+}
+
+function button(parent: HTMLElement, text: string, opts: { icon?: string; primary?: boolean; ghost?: boolean } = {}): HTMLButtonElement {
+	const el = parent.createEl("button", { cls: `mt-btn${opts.primary ? " is-primary" : ""}${opts.ghost ? " is-ghost" : ""}` });
+	if (opts.icon) setIcon(el.createSpan({ cls: "mt-btn-icon" }), opts.icon);
+	el.createSpan({ text });
+	return el;
+}
+
+function iconButton(parent: HTMLElement, name: string, label: string): HTMLButtonElement {
+	const el = parent.createEl("button", { cls: "mt-icon-btn", attr: { "aria-label": label } });
+	setIcon(el, name);
+	return el;
+}
+
 export class TaskView extends ItemView {
 	private sections: Record<string, HTMLElement> = {};
 	// Each section re-renders only when its data changes, so a click is never lost to a redraw.
 	private shown: Record<string, string> = {};
+	// Cards seen in an earlier draw; only new ones play the entrance animation.
+	private seen = new Set<string>();
+	private primed = false;
+	private activeId: string | null = null;
+	private polling: number | null = null;
+	private generation = 0;
+	private refreshing = false;
+	private opened = false;
+	private refreshAgain = false;
 
 	constructor(leaf: WorkspaceLeaf, private readonly plugin: MeetingTranscriberPlugin) {
 		super(leaf);
+		const visible = () => {
+			this.stopPolling();
+			if (this.opened && this.isVisible()) void this.refresh();
+		};
+		this.registerEvent(this.app.workspace.on("layout-change", visible));
+		this.registerDomEvent(this.containerEl.ownerDocument, "visibilitychange", visible);
+		this.register(() => this.halt());
 	}
 
 	getViewType() {
@@ -49,144 +107,293 @@ export class TaskView extends ItemView {
 	}
 
 	async onOpen() {
+		this.opened = true;
+		this.generation++;
+		this.shown = {};
+		this.seen.clear();
+		this.primed = false;
+		this.activeId = null;
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("mt-view");
-		for (const name of ["service", "active", "offered", "recent", "watcher"]) {
+		for (const name of ["service", "active", "need", "done", "watcher"]) {
 			this.sections[name] = root.createDiv({ cls: `mt-section mt-${name}` });
 		}
-		this.registerInterval(window.setInterval(() => void this.refresh(), POLL_MS));
 		await this.refresh();
 	}
 
+	async onClose() {
+		this.halt();
+	}
+
+	/** Stops polling and discards any response still in flight. */
+	private halt() {
+		this.opened = false;
+		this.generation++;
+		this.stopPolling();
+	}
+
+	private isVisible() {
+		return !this.containerEl.ownerDocument.hidden && this.containerEl.isShown();
+	}
+
+	private stopPolling() {
+		if (this.polling !== null) window.clearTimeout(this.polling);
+		this.polling = null;
+	}
+
 	async refresh() {
+		if (!this.opened || !this.isVisible()) return;
+		if (this.refreshing) { this.refreshAgain = true; return; }
+		this.stopPolling();
+		this.refreshAgain = false;
+		this.refreshing = true;
+		const generation = this.generation;
 		let state: ServiceState | null = null;
+		let failure: Error | null = null;
 		try {
 			state = await this.plugin.api.state();
-		} catch {
-			// The tray is not running; render the offline state below.
+		} catch (error) {
+			failure = error instanceof Error ? error : new Error(String(error));
+		} finally {
+			this.refreshing = false;
 		}
-		this.draw("service", state ? "up" : "down", el => this.drawService(el, state !== null));
+		if (!this.opened) return;
+		if (generation !== this.generation) { void this.refresh(); return; }
+		if (!this.isVisible()) return;
+		const busy = state?.active || state?.recent.some(job => job.status === "queued");
+		this.polling = window.setTimeout(() => void this.refresh(), this.refreshAgain ? 0 : busy ? POLL_MS : IDLE_POLL_MS);
+		this.draw("service", state ? "up" : String(failure), el => this.drawService(el, failure));
 		if (!state) {
-			for (const name of ["active", "offered", "recent", "watcher"]) this.draw(name, "", el => el.empty());
+			for (const name of ["active", "need", "done", "watcher"]) this.draw(name, "", el => el.empty());
+			this.activeId = null;
 			return;
 		}
-		const archived = this.plugin.settings.archived;
-		this.draw("active", JSON.stringify(state.active), el => this.drawActive(el, state.active));
-		this.draw("offered", JSON.stringify(state.offered), el => this.drawOffered(el, state.offered));
 		const recent = state.recent.filter(job => job.job_id !== state.active?.job_id);
-		this.draw("recent", JSON.stringify([recent, archived]), el => this.drawRecent(el, recent));
+		const queued = recent.filter(job => job.status === "queued");
+		const todo = recent.filter(job => DONE.has(job.status) && !this.linkedNote(job));
+		const failed = recent.filter(job => job.status === "failed");
+		const done = recent.filter(job => (DONE.has(job.status) && this.linkedNote(job)) || job.status === "cancelled");
+		const archived = this.plugin.settings.archived;
+		this.drawActive(state.active, queued);
+		this.draw("need", JSON.stringify([state.offered, todo, failed]), el => this.drawNeed(el, state.offered, todo, failed));
+		this.draw("done", JSON.stringify([done.slice(0, DONE_LIMIT), done.map(job => archived[job.job_id])]),
+			el => this.drawDone(el, done.slice(0, DONE_LIMIT)));
 		this.draw("watcher", JSON.stringify(state.watcher), el => this.drawWatcher(el, state.watcher));
+		this.primed = true;
 	}
 
 	private draw(name: string, key: string, render: (el: HTMLElement) => void) {
 		if (this.shown[name] === key) return;
-		this.shown[name] = key;
 		const el = this.sections[name];
 		el.empty();
 		render(el);
+		this.shown[name] = key;
 	}
 
-	private async act(action: () => Promise<unknown>) {
+	/** Marks a card for the entrance animation the first time it appears. */
+	private card(parent: HTMLElement, key: string, cls: string): HTMLElement {
+		const fresh = this.primed && !this.seen.has(key);
+		this.seen.add(key);
+		return parent.createDiv({ cls: `${cls}${fresh ? " mt-enter" : ""}` });
+	}
+
+	private async act(action: () => Promise<unknown>, card?: HTMLElement) {
+		if (card) {
+			card.addClass("mt-leave");
+			await new Promise(resolve => window.setTimeout(resolve, LEAVE_MS));
+		}
 		try {
 			await action();
 		} catch (error) {
+			card?.removeClass("mt-leave");
 			new Notice(`转录服务：${(error as Error).message}`);
 		}
 		await this.refresh();
 	}
 
-	private drawService(el: HTMLElement, up: boolean) {
-		const head = el.createDiv({ cls: "mt-head" });
-		head.createSpan({ cls: `mt-dot ${up ? "is-up" : "is-down"}` });
-		head.createSpan({ text: up ? "转录服务运行中" : "转录服务没有运行" });
-		if (!up) {
-			const button = el.createEl("button", { text: "启动转录服务", cls: "mod-cta" });
-			button.onclick = () => this.plugin.startService();
+	private async copy(button: HTMLButtonElement, path: string) {
+		if (button.hasClass("is-done")) return;
+		if (!await this.plugin.copyOrganizeCommand(path)) return;
+		const label = button.querySelector("span:last-child");
+		const old = label?.textContent ?? "";
+		button.addClass("is-done");
+		if (label) label.textContent = "已复制";
+		window.setTimeout(() => {
+			button.removeClass("is-done");
+			if (label) label.textContent = old;
+		}, 1400);
+	}
+
+	private drawService(el: HTMLElement, failure: Error | null) {
+		if (failure === null) return;
+		const card = el.createDiv({ cls: "mt-card mt-down" });
+		const top = card.createDiv({ cls: "mt-top" });
+		icon(top, "plug-zap", "mt-tile is-bad");
+		const info = top.createDiv({ cls: "mt-info" });
+		info.createDiv({ cls: "mt-name", text: "转录服务没有运行" });
+		info.createDiv({ cls: "mt-sub", text: failure.message, attr: { title: failure.message } });
+		if (failure instanceof ApiError && failure.kind === "connection") {
+			const acts = card.createDiv({ cls: "mt-acts" });
+			button(acts, "启动转录服务", { icon: "play", primary: true }).onclick = () => this.plugin.startService();
 		}
 	}
 
-	private drawActive(el: HTMLElement, job: Job | null) {
-		if (!job) return;
-		el.createEl("h6", { text: "当前任务" });
-		el.createDiv({ cls: "mt-name", text: basename(job.source_path) });
-		el.createDiv({ cls: "mt-muted", text: job.message || STATUS[job.status] || job.status });
-		const bar = el.createEl("progress", { cls: "mt-progress" });
-		bar.max = 1;
-		bar.value = job.progress ?? 0;
-		const cancel = el.createEl("button", { text: "取消" });
-		cancel.onclick = () => this.act(() => this.plugin.api.cancel());
-	}
-
-	private drawOffered(el: HTMLElement, paths: string[]) {
-		if (!paths.length) return;
-		el.createEl("h6", { text: `新录屏（${paths.length}）` });
-		for (const path of paths) {
-			const row = el.createDiv({ cls: "mt-row" });
-			row.createDiv({ cls: "mt-name", text: basename(path) });
-			const actions = row.createDiv({ cls: "mt-actions" });
-			actions.createEl("button", { text: "转录", cls: "mod-cta" }).onclick = () =>
-				this.act(() => this.plugin.api.accept(path));
-			actions.createEl("button", { text: "忽略" }).onclick = () => this.act(() => this.plugin.api.dismiss(path));
+	/** The running job updates in place, so its bar moves instead of the card re-entering every poll. */
+	private drawActive(job: Job | null, queued: Job[]) {
+		const el = this.sections.active;
+		const queueKey = JSON.stringify(queued.map(q => q.job_id));
+		if (job && job.job_id === this.activeId && this.shown.active === queueKey) {
+			this.updateActive(el, job);
+			return;
+		}
+		el.empty();
+		this.activeId = job?.job_id ?? null;
+		this.shown.active = queueKey;
+		if (!job) {
+			if (!queued.length) return;
+		}
+		el.createDiv({ cls: "mt-label", text: job ? (queued.length ? `正在转录 · 之后还有 ${queued.length} 个` : "正在转录") : "排队中" });
+		if (job) {
+			const card = this.card(el, job.job_id, "mt-card mt-hero");
+			const top = card.createDiv({ cls: "mt-top" });
+			icon(top, VIDEO.test(job.source_path) ? "film" : "mic");
+			const info = top.createDiv({ cls: "mt-info" });
+			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			const sub = info.createDiv({ cls: "mt-sub" });
+			sub.createSpan({ cls: "mt-stage" });
+			sub.createSpan({ text: " · " });
+			sub.createSpan({ cls: "mt-pct mt-mono" });
+			const cancel = iconButton(top, "square", "取消");
+			cancel.onclick = () => this.act(() => this.plugin.api.cancel());
+			card.createDiv({ cls: "mt-bar" }).createDiv({ cls: "mt-bar-fill" });
+			const steps = card.createDiv({ cls: "mt-steps" });
+			STEPS.forEach(step => steps.createSpan({ text: step }));
+			this.updateActive(el, job);
+		}
+		for (const q of queued) {
+			const row = this.card(el, q.job_id, "mt-card mt-slim");
+			icon(row, "clock", "mt-tile is-plain");
+			row.createDiv({ cls: "mt-name is-light", text: basename(q.source_path), attr: { title: q.source_path } });
+			row.createSpan({ cls: "mt-mono mt-faint", text: "排队中" });
 		}
 	}
 
-	private drawRecent(el: HTMLElement, jobs: Job[]) {
-		el.createEl("h6", { text: "最近任务" });
-		if (!jobs.length) el.createDiv({ cls: "mt-muted", text: "还没有任务。在资源管理器里右键录音选“转录”，或从托盘菜单添加。" });
+	private updateActive(el: HTMLElement, job: Job) {
+		const p = overall(job);
+		const fill = el.querySelector<HTMLElement>(".mt-bar-fill");
+		if (fill) fill.style.transform = `scaleX(${p})`;
+		const stage = el.querySelector(".mt-stage");
+		if (stage) stage.textContent = job.status === "cancel_requested" ? STATUS.cancel_requested : STEPS[STEP_OF[job.stage] ?? 0];
+		const pct = el.querySelector(".mt-pct");
+		if (pct) pct.textContent = `${Math.round(p * 100)}%`;
+		const current = STEP_OF[job.stage] ?? 0;
+		el.querySelectorAll(".mt-steps span").forEach((step, i) => {
+			step.toggleClass("is-past", i < current);
+			step.toggleClass("is-now", i === current);
+		});
+	}
+
+	private drawNeed(el: HTMLElement, offered: string[], todo: Job[], failed: Job[]) {
+		const count = offered.length + todo.length + failed.length;
+		if (!count) return;
+		el.createDiv({ cls: "mt-label", text: `需要你处理 · ${count}` });
+		for (const path of offered) {
+			const card = this.card(el, `offer:${path}`, "mt-card");
+			const top = card.createDiv({ cls: "mt-top" });
+			icon(top, "film");
+			const info = top.createDiv({ cls: "mt-info" });
+			info.createDiv({ cls: "mt-name", text: basename(path), attr: { title: path } });
+			info.createDiv({ cls: "mt-sub", text: "OBS 新录屏" });
+			top.createSpan({ cls: "mt-chip is-warn", text: "新" });
+			const acts = card.createDiv({ cls: "mt-acts" });
+			button(acts, "转录", { icon: "mic", primary: true }).onclick = () => this.act(() => this.plugin.api.accept(path), card);
+			button(acts, "忽略", { ghost: true }).onclick = () => this.act(() => this.plugin.api.dismiss(path), card);
+		}
+		for (const job of todo) {
+			const card = this.card(el, job.job_id, "mt-card");
+			const top = card.createDiv({ cls: "mt-top" });
+			icon(top, "file-text");
+			const info = top.createDiv({ cls: "mt-info" });
+			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			info.createDiv({ cls: "mt-sub", text: `${when(job.finished_at || job.created_at)} 转完` });
+			const warned = job.status === "completed_with_warning";
+			top.createSpan({ cls: `mt-chip${warned ? " is-warn" : ""}`, text: warned ? "有警告" : "待整理", attr: warned && job.error ? { title: job.error } : {} });
+			const acts = card.createDiv({ cls: "mt-acts" });
+			if (job.output_path) {
+				const copy = button(acts, "复制整理命令", { icon: "copy", primary: true });
+				copy.onclick = () => this.copy(copy, job.output_path);
+			}
+			button(acts, "关联整理稿").onclick = () => this.plugin.linkNote(job.job_id);
+			iconButton(acts, "more-horizontal", "更多").onclick = event => this.menu(job).showAtMouseEvent(event);
+			card.oncontextmenu = event => { event.preventDefault(); this.menu(job).showAtMouseEvent(event); };
+		}
+		for (const job of failed) {
+			const card = this.card(el, job.job_id, "mt-card");
+			const top = card.createDiv({ cls: "mt-top" });
+			icon(top, "alert-circle", "mt-tile is-bad");
+			const info = top.createDiv({ cls: "mt-info" });
+			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			info.createDiv({ cls: "mt-sub mt-error", text: job.error || job.message, attr: { title: job.error || job.message } });
+			top.createSpan({ cls: "mt-chip is-bad", text: "失败" });
+			const acts = card.createDiv({ cls: "mt-acts" });
+			button(acts, "重试", { icon: "rotate-ccw" }).onclick = () => this.act(() => this.plugin.api.retry(job.job_id), card);
+		}
+	}
+
+	private drawDone(el: HTMLElement, jobs: Job[]) {
+		el.createDiv({ cls: "mt-label", text: "已完成" });
+		if (!jobs.length) {
+			el.createDiv({ cls: "mt-empty", text: "还没有任务。在资源管理器里右键录音选“转录”，或从托盘菜单添加。" });
+			return;
+		}
 		for (const job of jobs) {
-			const row = el.createDiv({ cls: `mt-row is-${job.status}` });
-			const info = row.createDiv({ cls: "mt-info" });
-			info.createDiv({ cls: "mt-name", text: basename(job.source_path) });
-			const detail = `${STATUS[job.status] ?? job.status} · ${when(job.finished_at || job.created_at)}`;
-			info.createDiv({ cls: "mt-muted", text: detail });
-			if (job.error) info.createDiv({ cls: "mt-error", text: job.error, attr: { title: job.error } });
-			const actions = row.createDiv({ cls: "mt-actions" });
-			this.addJobActions(actions, job);
+			const row = this.card(el, job.job_id, "mt-card mt-slim");
+			const cancelled = job.status === "cancelled";
+			icon(row, cancelled ? "x" : "check", `mt-tile is-plain${cancelled ? "" : " is-ok"}`);
+			row.createDiv({ cls: "mt-name is-light", text: basename(job.source_path), attr: { title: job.source_path } });
+			row.createSpan({ cls: "mt-mono mt-faint", text: cancelled ? "已取消" : when(job.finished_at || job.created_at).slice(0, 5) });
+			const note = this.linkedNote(job);
+			if (note) iconButton(row, "external-link", "打开整理稿").onclick = () => this.app.workspace.getLeaf(false).openFile(note);
+			iconButton(row, "more-horizontal", "更多").onclick = event => this.menu(job).showAtMouseEvent(event);
+			row.oncontextmenu = event => { event.preventDefault(); this.menu(job).showAtMouseEvent(event); };
 		}
 	}
 
-	private addJobActions(actions: HTMLElement, job: Job) {
-		const archivedPath = this.plugin.settings.archived[job.job_id];
-		const archived = archivedPath ? this.app.vault.getAbstractFileByPath(archivedPath) : null;
-		if (archived instanceof TFile) {
-			actions.createEl("button", { text: "打开" }).onclick = () => this.app.workspace.getLeaf(false).openFile(archived);
-		} else if (DONE.has(job.status) && job.output_path && existsSync(job.output_path)) {
-			actions.createEl("button", { text: "归档…", cls: "mod-cta" }).onclick = () => this.archive(job);
-		} else if (DONE.has(job.status)) {
-			actions.createSpan({ cls: "mt-muted", text: "转录稿已移走" });
+	private menu(job: Job): Menu {
+		const menu = new Menu();
+		const note = this.linkedNote(job);
+		if (note) menu.addItem(item => item.setTitle("打开整理稿").setIcon("external-link").onClick(() => this.app.workspace.getLeaf(false).openFile(note)));
+		if (DONE.has(job.status) && job.output_path) {
+			menu.addItem(item => item.setTitle("复制整理命令").setIcon("copy").onClick(() => this.plugin.copyOrganizeCommand(job.output_path)));
+			menu.addItem(item => item.setTitle("打开原稿").setIcon("file-text").onClick(() => this.plugin.openTranscript(job.output_path)));
+			menu.addItem(item => item.setTitle(note ? "重新关联整理稿…" : "关联整理稿…").setIcon("link").onClick(() => this.plugin.linkNote(job.job_id)));
 		}
 		if (RETRYABLE.has(job.status)) {
-			actions.createEl("button", { text: "重试" }).onclick = () => this.act(() => this.plugin.api.retry(job.job_id));
+			menu.addSeparator();
+			menu.addItem(item => item.setTitle("重试").setIcon("rotate-ccw").onClick(() => this.act(() => this.plugin.api.retry(job.job_id))));
 		}
+		return menu;
 	}
 
-	private async archive(job: Job) {
-		const settings = this.plugin.settings;
-		const suggested = suggestFolder(this.app, transcriptTitle(job.output_path));
-		const last = this.app.vault.getFolderByPath(settings.lastFolder);
-		const first = [...new Set([suggested, last])].filter((f): f is TFolder => f !== null);
-		const folder = await pickFolder(this.app, first);
-		if (!folder) return;
-		try {
-			const file = await moveIntoVault(this.app, job.output_path, folder);
-			settings.archived[job.job_id] = file.path;
-			settings.lastFolder = folder.path;
-			await this.plugin.saveSettings();
-			await this.app.workspace.getLeaf(true).openFile(file);
-			new Notice(`已归档到 ${file.path}`);
-		} catch (error) {
-			new Notice(`归档失败：${(error as Error).message}`);
-		}
-		await this.refresh();
+	/** The organized note the user associated with this job, while it still exists. */
+	private linkedNote(job: Job): TFile | null {
+		const path = this.plugin.settings.archived[job.job_id];
+		const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
+		return file instanceof TFile ? file : null;
 	}
 
 	private drawWatcher(el: HTMLElement, watcher: ServiceState["watcher"]) {
-		const label = el.createEl("label", { cls: "mt-toggle" });
-		const box = label.createEl("input", { type: "checkbox" });
-		box.checked = watcher.enabled;
-		box.onchange = () => this.act(() => this.plugin.api.setWatching(box.checked));
-		label.createSpan({ text: " 监听 OBS 录制目录，发现新录屏时询问是否转录" });
-		el.createDiv({ cls: "mt-muted", text: watcher.dir });
+		const row = el.createDiv({ cls: "mt-watch" });
+		const text = row.createDiv({ cls: "mt-info" });
+		text.createDiv({ text: "监听 OBS 录屏" });
+		text.createDiv({ cls: "mt-sub mt-mono", text: watcher.dir, attr: { title: watcher.dir } });
+		const toggle = row.createDiv({ cls: `checkbox-container${watcher.enabled ? " is-enabled" : ""}`, attr: { "aria-label": "发现新录屏时询问是否转录" } });
+		toggle.createEl("input", { type: "checkbox", attr: { tabindex: "0" } });
+		toggle.onclick = () => {
+			const next = !toggle.hasClass("is-enabled");
+			toggle.toggleClass("is-enabled", next);
+			void this.act(() => this.plugin.api.setWatching(next));
+		};
 	}
 }

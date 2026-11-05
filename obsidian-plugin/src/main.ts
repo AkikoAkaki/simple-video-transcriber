@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
-import { FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
+import { access } from "fs/promises";
+import { FileSystemAdapter, FuzzySuggestModal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
 import { TranscriberApi } from "./api";
 import { TaskView, VIEW_TYPE } from "./view";
 
@@ -7,15 +8,13 @@ interface Settings {
 	port: number;
 	/** Started when the panel finds no running tray. */
 	startScript: string;
-	lastFolder: string;
-	/** job id -> vault path of the archived transcript */
+	/** job id -> vault path explicitly associated by the user; legacy archive links remain usable. */
 	archived: Record<string, string>;
 }
 
 const DEFAULTS: Settings = {
 	port: 47321,
 	startScript: "I:\\Projects\\meeting-transcriber\\start.bat",
-	lastFolder: "",
 	archived: {},
 };
 const MEDIA = new Set(["mp4", "m4a", "mov", "mkv", "webm", "mp3", "wav", "flac", "aac", "opus"]);
@@ -25,7 +24,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
 	api = new TranscriberApi(() => this.settings.port);
 
 	async onload() {
-		this.settings = { ...DEFAULTS, ...(await this.loadData()) };
+		const saved = await this.loadData();
+		const links: unknown = saved?.archived;
+		this.settings = {
+			port: Number.isInteger(saved?.port) && saved.port > 0 && saved.port <= 65535 ? saved.port : DEFAULTS.port,
+			startScript: typeof saved?.startScript === "string" ? saved.startScript : DEFAULTS.startScript,
+			archived: typeof links === "object" && links !== null && !Array.isArray(links)
+				? Object.fromEntries(Object.entries(links).filter(([, path]) => typeof path === "string")) : {},
+		};
 		this.registerView(VIEW_TYPE, leaf => new TaskView(leaf, this));
 		this.addRibbonIcon("mic", "转录任务", () => this.openPanel());
 		this.addCommand({ id: "open-panel", name: "打开转录任务面板", callback: () => this.openPanel() });
@@ -41,11 +47,64 @@ export default class MeetingTranscriberPlugin extends Plugin {
 			if (!media.length) return;
 			menu.addItem(item => item.setTitle(`转录 ${media.length} 个文件`).setIcon("mic").onClick(() => this.queue(media)));
 		}));
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+			void this.updateNoteLinks(oldPath, file.path).catch(error => new Notice(`保存关联失败：${String(error)}`));
+		}));
+		this.registerEvent(this.app.vault.on("delete", file => {
+			void this.updateNoteLinks(file.path, null).catch(error => new Notice(`保存关联失败：${String(error)}`));
+		}));
 		this.addSettingTab(new TranscriberSettingTab(this));
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async updateNoteLinks(oldPath: string, newPath: string | null) {
+		let changed = false;
+		for (const [id, path] of Object.entries(this.settings.archived)) {
+			if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
+			if (newPath === null) delete this.settings.archived[id];
+			else this.settings.archived[id] = newPath + path.slice(oldPath.length);
+			changed = true;
+		}
+		if (changed) {
+			await this.saveSettings();
+			void this.refreshViews();
+		}
+	}
+
+	async refreshViews() {
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+			if (leaf.view instanceof TaskView) await leaf.view.refresh();
+		}
+	}
+
+	async openTranscript(path: string) {
+		try {
+			await access(path);
+			const child = spawn("explorer.exe", [path], { stdio: "ignore", windowsHide: true });
+			child.on("error", error => new Notice(`无法打开原稿：${error.message}`));
+			child.unref();
+		} catch (error) {
+			new Notice(`原稿不存在或无法读取：${String(error)}`);
+		}
+	}
+
+	async copyOrganizeCommand(path: string): Promise<boolean> {
+		try {
+			await access(path);
+			await navigator.clipboard.writeText(`/transcript ${JSON.stringify(path)}`);
+			new Notice("已复制整理命令，请在 vault 的 OpenCode 会话中运行；原稿会保留");
+			return true;
+		} catch (error) {
+			new Notice(`无法复制整理命令：${String(error)}`);
+			return false;
+		}
+	}
+
+	linkNote(jobId: string) {
+		new NoteModal(this, jobId).open();
 	}
 
 	async openPanel() {
@@ -93,7 +152,7 @@ class TranscriberSettingTab extends PluginSettingTab {
 			.setDesc("和转录程序 config.py 里的 API_PORT 一致。")
 			.addText(text => text.setValue(String(this.plugin.settings.port)).onChange(async value => {
 				const port = Number(value);
-				if (Number.isInteger(port) && port > 0) {
+				if (Number.isInteger(port) && port > 0 && port <= 65535) {
 					this.plugin.settings.port = port;
 					await this.plugin.saveSettings();
 				}
@@ -122,5 +181,24 @@ class TranscriberSettingTab extends PluginSettingTab {
 					new Notice(`保存失败：${(error as Error).message}`);
 				}
 			}));
+	}
+}
+
+class NoteModal extends FuzzySuggestModal<TFile> {
+	constructor(private readonly plugin: MeetingTranscriberPlugin, private readonly jobId: string) {
+		super(plugin.app);
+		this.setPlaceholder("选择已经整理好的笔记；关联不会修改文件");
+	}
+	getItems() { return this.app.vault.getMarkdownFiles(); }
+	getItemText(file: TFile) { return file.path; }
+	async onChooseItem(file: TFile) {
+		try {
+			this.plugin.settings.archived[this.jobId] = file.path;
+			await this.plugin.saveSettings();
+			await this.plugin.refreshViews();
+			new Notice(`已关联 ${file.path}`);
+		} catch (error) {
+			new Notice(`关联失败：${String(error)}`);
+		}
 	}
 }

@@ -9,7 +9,7 @@
 - **右键转录**：在资源管理器里右键音视频文件，选“转录”（Windows 11 在“显示更多选项”里），文件直接进入队列；托盘没运行时会自动启动。运行一次 `setup_context_menu.ps1` 添加这个菜单。
 - **托盘菜单**：右键托盘图标可以选文件转录、取消当前任务、开关监听、更改监听目录、设置 HuggingFace Token、清理音频缓存。左键单击托盘图标打开 Obsidian 里的任务面板。
 - **OBS 录屏**：开启监听后，监听目录里录完的新文件不会直接转录，而是弹通知询问；点通知，或在托盘的“新录屏”菜单、Obsidian 面板里点“转录”，才加入队列。启动前已有的存档不会被处理。
-- **Obsidian 面板**：`obsidian-plugin/` 里的插件显示当前任务、新录屏和最近任务，可以取消、重试，并把完成的转录稿归档进 vault。归档时按文件名里的课程代码（如 `CSC 290`）推荐对应的 `Lecture Transcripts` 文件夹；转录稿写进 vault 并核对一致后，才删除 `transcripts/` 里的原文件。vault 里的音视频文件也可以右键“转录”。
+- **Obsidian 面板**：`obsidian-plugin/` 里的插件显示当前任务、新录屏和最近任务，可以取消、重试。完成后可以打开原稿、复制含完整原稿路径的 `/transcript` 命令，或关联已整理的笔记。在 vault 的 OpenCode 会话中运行复制的命令，需要已有的 `transcript` 自定义命令；插件不会后台启动 agent。原稿留在 `transcripts/`，关联笔记的改名和移动会同步更新。vault 里的音视频文件也可以右键“转录”。
 - **agent / 命令行**：调用 `transcribe.py`，与托盘使用同一转录流程。成功退出码为 0，失败为非零。
 
 转完会弹 Windows 通知，点击打开 Obsidian 面板。输出文件名保留源文件指纹，重复出现的 `New Recording 4` 会按不同文件版本区分。重试沿用原任务设置并使用当前 Token，需要原音视频仍在且未被替换；改了内容的同名录音要重新导入。
@@ -40,6 +40,8 @@ powershell -ExecutionPolicy Bypass -File setup_context_menu.ps1
 
 Obsidian 插件：在 `obsidian-plugin/` 运行 `npm install` 和 `npm run deploy`，产物会复制到 `E:/obsidian-vault/.obsidian/plugins/meeting-transcriber`（用环境变量 `VAULT_PLUGIN_DIR` 指定其他 vault），再在 Obsidian 的第三方插件里启用 Meeting Transcriber。插件通过 `127.0.0.1:47321`（`config.py` 的 `API_PORT`）和托盘通信，每个请求都要带 `%LOCALAPPDATA%/SimpleVideoTranscriber/api_token` 里的密钥，网页无法读取这个文件，所以不能借此往队列里加文件。
 
+面板有排队或运行任务时每 2 秒查询，空闲或服务不可用时每 15 秒查询。面板或文档隐藏时暂停，重新显示时立即刷新。请求超过 10 秒会断开连接；超时的操作不会自动重试，请先查看任务状态再重新提交。鉴权和响应错误会与连接失败分开显示。
+
 ## 命令行
 
 使用安装依赖的 Python；通过安装脚本配置的环境可调用 `.venv\Scripts\python.exe`：
@@ -55,9 +57,9 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 ## 输出与配置
 
-- `transcripts/`：转录结果的中转目录。Obsidian 面板的“归档”会把转录稿移进 vault，也可以手动搬。Markdown 写入完整后才替换正式文件；写入失败保留已有文件。
+- `transcripts/`：原始转录稿，供独立的整理流程读取。插件不移动、改写或删除这些文件。Markdown 写入完整后才替换正式文件；写入失败保留已有文件。
 - `cache/`：音频中间文件和识别、分离、合并结果。托盘的“清理音频缓存”只清理与已结束任务关联的音频缓存，保留 JSON 和 Markdown。
-- `%LOCALAPPDATA%/SimpleVideoTranscriber/`：托盘设置、任务数据库、文本日志、本地接口密钥 `api_token` 和 Parakeet 模型。已有历史事件表保留，但不再写入新事件。
+- `%LOCALAPPDATA%/SimpleVideoTranscriber/`：托盘设置、任务数据库、文本日志、本地接口密钥 `api_token` 和 Parakeet 模型。
 
 命令行和托盘任务不能同时处理同一版本的录音。其他任务正在使用它时，转录会报音频缓存被占用，等该任务结束后再重试。清理音频缓存会跳过占用中的 WAV。
 

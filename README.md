@@ -9,7 +9,7 @@ A personal Windows tool that turns OBS meeting recordings, iPhone Voice Memos, a
 - **Right-click:** in Explorer, right-click an audio or video file and choose 转录 (on Windows 11 it is under "Show more options"). The file is queued, and the tray starts if it is not running. Run `setup_context_menu.ps1` once to add the entry.
 - **Tray menu:** right-click the tray icon to pick files, cancel the current task, toggle the watcher, change the watch folder, save the HuggingFace token, or clear the audio cache. Left-click opens the task panel in Obsidian.
 - **OBS recordings:** with the watcher on, a finished new recording in the watch folder is not transcribed right away. A notification asks first; click it, or choose 转录 in the tray's 新录屏 menu or the Obsidian panel, to queue it. Recordings already present at startup are ignored.
-- **Obsidian panel:** the plugin in `obsidian-plugin/` shows the current task, new recordings, and recent tasks. It cancels and retries tasks and archives finished transcripts into the vault, suggesting the course's `Lecture Transcripts` folder from a course code in the filename (such as `CSC 290`). The copy in `transcripts/` is deleted only after the vault copy reads back identical. Audio and video files inside the vault also get a 转录 entry in their context menu.
+- **Obsidian panel:** the plugin in `obsidian-plugin/` shows the current task, new recordings, and recent tasks. It cancels and retries tasks. For completed tasks, open the raw transcript, copy a `/transcript` command containing its full path, or associate an existing organized note. Run the copied command in your vault's OpenCode session with your existing `transcript` custom command; the plugin does not run an agent in the background. Raw transcripts stay in `transcripts/`. Associated note paths follow vault renames and moves. Audio and video files inside the vault also get a 转录 entry in their context menu.
 - **Agents / CLI:** call `transcribe.py`. It uses the same pipeline as the tray. Success exits with code 0; failure exits with a nonzero code.
 
 A Windows notification appears when a task ends; clicking it opens the Obsidian panel. Output names retain source fingerprints to distinguish replaced files such as repeated `New Recording 4` recordings. A retry reuses the task's original settings and the current token; the source recording must still exist and match the original file version, so import a replaced recording as a new task.
@@ -40,6 +40,8 @@ powershell -ExecutionPolicy Bypass -File setup_context_menu.ps1
 
 Obsidian plugin: in `obsidian-plugin/`, run `npm install` and `npm run deploy`, which copies the build into `E:/obsidian-vault/.obsidian/plugins/meeting-transcriber` (set `VAULT_PLUGIN_DIR` for another vault), then enable Meeting Transcriber under Community plugins. The plugin talks to the tray on `127.0.0.1:47321` (`API_PORT` in `config.py`). Every request carries the secret from `%LOCALAPPDATA%/SimpleVideoTranscriber/api_token`; web pages cannot read that file, so they cannot queue files.
 
+The panel polls every 2 seconds while work is queued or running and every 15 seconds when idle or unavailable. Polling pauses while the panel or document is hidden and resumes when shown. Requests have a 10-second deadline that closes the connection. Timed-out actions are not automatically retried: check task state before submitting again. Authentication and response errors are shown separately from connection failures.
+
 ## Command line
 
 Use the Python environment containing the dependencies, such as `.venv\Scripts\python.exe` after running the installer:
@@ -55,9 +57,9 @@ python transcribe.py "meeting.mp4" --diarize-only
 
 ## Files and settings
 
-- `transcripts/`: a staging folder for results. The Obsidian panel's archive action moves a transcript into the vault; moving it by hand also works. Markdown is fully written before replacing the destination; write failures preserve the existing file.
+- `transcripts/`: raw results used by the separate organization workflow. The plugin does not move, rewrite, or delete these files. Markdown is fully written before replacing the destination; write failures preserve the existing file.
 - `cache/`: intermediate audio and recognition, diarization, and merged results. The tray's 清理音频缓存 removes only audio associated with terminal jobs, preserving JSON and Markdown.
-- `%LOCALAPPDATA%/SimpleVideoTranscriber/`: tray settings, the job database, text logs, the local API secret `api_token`, and the Parakeet model. Existing historical event tables remain intact but receive no new events.
+- `%LOCALAPPDATA%/SimpleVideoTranscriber/`: tray settings, the job database, text logs, the local API secret `api_token`, and the Parakeet model.
 
 CLI and tray tasks cannot process the same recording version concurrently. If another task is using it, transcription fails with an audio-cache-in-use error; retry after that task finishes. Clearing the audio cache skips WAVs in use.
 
