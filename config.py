@@ -1,6 +1,7 @@
-"""Defaults for the tray and the CLI; settings saved by the tray take precedence."""
-from pathlib import Path
+"""Defaults for the tray and the CLI. The tray saves only its watch folder and whether it is watching."""
+import json
 import os
+from pathlib import Path
 
 # ── Directories ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).parent.resolve()
@@ -40,37 +41,18 @@ LANGUAGE = None
 #   "cpu"   → force CPU (slow but always works)
 DEVICE = "auto"
 
-# ── Speaker Diarization (pyannote) ───────────────────────────────────────────
-# HuggingFace token — needed to download pyannote models.
-# Leave empty to use the token saved from the tray or plugin, or the HF_TOKEN environment variable.
-# Get a free token at: https://hf.co/settings/tokens
-# Then accept model terms at:
-#   https://hf.co/pyannote/speaker-diarization-3.1
-#   https://hf.co/pyannote/segmentation-3.0
-HF_TOKEN = ""
-
-# Upper limit on speaker count; use NUM_SPEAKERS for an exact count.
-# None = auto-detect.
-MAX_SPEAKERS = None
-
-# Exact speaker count, when known for a recording.  Leave unset to let
-# pyannote estimate the number of speakers automatically.
-NUM_SPEAKERS = None
-
-# Optional comma-separated names and technical terms passed to Whisper.
-HOTWORDS = ""
-
 # ── Local API ────────────────────────────────────────────────────────────────
-# The Obsidian plugin and the Explorer "转录" menu reach the tray on this
-# 127.0.0.1 port.
+# The Explorer "转录" menu and the Obsidian plugin reach the tray on this 127.0.0.1 port.
 API_PORT = 47321
 
 # ── Watcher ──────────────────────────────────────────────────────────────────
 # Files smaller than this are ignored (filters out accidental tiny files).
 MIN_FILE_SIZE_KB = 100
 
-# Supported video/audio extensions the watcher will pick up.
-WATCH_EXTENSIONS = {
-    ".mp4", ".m4a", ".mov", ".mkv", ".webm", ".mp3", ".wav",
-    ".ts", ".flac", ".aac", ".opus",
-}
+# A recording counts as finished once its size has held still this long.
+STABLE_SECONDS = 15
+
+# The Explorer menu and the Obsidian plugin offer only audio and video: .ts on a
+# developer machine is far more often TypeScript than a video stream.
+_MEDIA = json.loads((ROOT_DIR / "media_extensions.json").read_text(encoding="utf-8"))
+WATCH_EXTENSIONS = {*_MEDIA["audio"], *_MEDIA["video"], *_MEDIA["watch_only"]}

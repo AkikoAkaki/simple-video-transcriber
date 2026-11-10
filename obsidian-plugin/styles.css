@@ -281,14 +281,6 @@
 	color: var(--text-normal);
 }
 
-.mt-view button.mt-btn.is-done {
-	color: var(--color-green);
-}
-
-.mt-view button.mt-btn.is-primary.is-done {
-	color: var(--background-primary);
-}
-
 .mt-btn-icon {
 	display: flex;
 }
@@ -349,7 +341,7 @@
 .mt-leave {
 	opacity: 0;
 	transform: scale(0.96);
-	transition: opacity 0.16s var(--mt-ease), transform 0.16s var(--mt-ease);
+	transition: opacity var(--mt-leave) var(--mt-ease), transform var(--mt-leave) var(--mt-ease);
 	pointer-events: none;
 }
 

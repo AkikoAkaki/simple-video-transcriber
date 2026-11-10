@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
+import ctypes
 import subprocess
+from ctypes import wintypes
 
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
@@ -14,21 +15,13 @@ PROCESS_SET_QUOTA = 0x0100
 def terminate_process_tree(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
         return
-    if os.name == "nt":
-        try:
-            result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                                    capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                return
-        except (OSError, subprocess.SubprocessError):
-            pass
-    else:
-        import signal
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    try:
+        result = subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
             return
-        except OSError:
-            pass
+    except (OSError, subprocess.SubprocessError):
+        pass
     try:
         proc.terminate()
     except OSError:
@@ -41,8 +34,6 @@ def create_kill_on_close_job():
     Without it a crashed or killed tray leaves the worker running its current
     job, holding GPU memory and the audio lock the recovered job then needs.
     """
-    import ctypes
-    from ctypes import wintypes
 
     class BasicLimits(ctypes.Structure):
         _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
@@ -69,9 +60,6 @@ def create_kill_on_close_job():
 
 
 def assign_to_job(job, pid: int) -> None:
-    import ctypes
-    from ctypes import wintypes
-
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]

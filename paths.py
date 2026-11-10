@@ -1,13 +1,17 @@
-"""Lightweight, dependency-free paths for source-specific artifacts."""
+"""Where each source recording's artifacts live, and how they are written safely."""
 
 from __future__ import annotations
 
 import hashlib
-import re
+import msvcrt
 import os
+import re
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
+
+import config
 
 
 @contextmanager
@@ -20,32 +24,22 @@ def audio_cache_lock(wav_path: Path):
             handle.write(b"\0")
             handle.flush()
         handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError as exc:
-                raise BlockingIOError("Audio cache is in use by another task") from exc
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise BlockingIOError("Audio cache is in use by another task") from exc
         try:
             yield
         finally:
             handle.seek(0)
-            if os.name == "nt":
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class SourceIdentity(NamedTuple):
     """One version of a source file.
 
     The path alone is not enough: OBS or a manual workflow can replace a file
-    at the same path. Including size and mtime prevents stale ML caches from
-    being reused for the new contents while preserving cache hits for an
-    unchanged file.
+    at the same path.
     """
 
     path: str
@@ -71,13 +65,32 @@ def source_fingerprint(input_path: Path) -> str:
     return fingerprint(source_identity(input_path).key)
 
 
-def wav_cache_path(cache_dir: Path, source_stem: str, source_fp: str) -> Path:
+def is_media_file(path: Path) -> bool:
+    return path.suffix.lower() in config.WATCH_EXTENSIONS and path.is_file()
+
+
+def wav_cache_path(source_stem: str, source_fp: str) -> Path:
     """The 16 kHz WAV a job converts its source to; its lock guards the partial file too."""
-    return Path(cache_dir) / f"{source_stem}_{source_fp}_16k.wav"
+    return config.CACHE_DIR / f"{source_stem}_{source_fp}_16k.wav"
 
 
 def partial_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.part{path.suffix}")
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Replace ``path`` in one step, so a failed write leaves the previous file intact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.stem}.", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class SourceChangedError(ValueError):
@@ -97,11 +110,11 @@ class JobPaths(NamedTuple):
     output_md: Path
 
 
-def job_paths(input_path: Path, cache_dir: Path, output_dir: Path, source_fp: str, title: str = "") -> JobPaths:
+def job_paths(input_path: Path, output_dir: Path, source_fp: str, title: str = "") -> JobPaths:
     stem = input_path.stem
     return JobPaths(
-        wav=wav_cache_path(cache_dir, stem, source_fp),
-        whisper_json=cache_dir / f"_{stem}_{source_fp}_whisper.json",
-        diarize_json=cache_dir / f"_{stem}_{source_fp}_diarize.json",
+        wav=wav_cache_path(stem, source_fp),
+        whisper_json=config.CACHE_DIR / f"_{stem}_{source_fp}_whisper.json",
+        diarize_json=config.CACHE_DIR / f"_{stem}_{source_fp}_diarize.json",
         output_md=transcript_path(input_path, output_dir, source_fp, title),
     )

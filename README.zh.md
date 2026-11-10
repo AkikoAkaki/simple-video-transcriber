@@ -16,7 +16,7 @@
 
 默认流程包含说话人分离，需要在托盘菜单或插件设置里保存 HuggingFace Token，并接受 [speaker-diarization-3.1](https://hf.co/pyannote/speaker-diarization-3.1) 和 [segmentation-3.0](https://hf.co/pyannote/segmentation-3.0) 的使用条款。缺少 Token 且无可用分离缓存、模型加载失败、分离运行失败或没有分离结果时，任务标记为失败，不发布本次 Markdown。
 
-标题、语言、人数和术语这类单次选项只在命令行提供（`--title`、`--language`、`--num-speakers`、`--max-speakers`、`--hotwords`、`--transcribe-only`）；托盘和面板使用 `config.py` 与保存的设置。包含学生互动的 lecture、seminar 或多人会议保持默认的完整流程。说话人标签是编号，不代表已核实身份。
+标题、语言、人数和术语这类单次选项只在命令行提供（`--title`、`--language`、`--num-speakers`、`--max-speakers`、`--hotwords`、`--transcribe-only`）；托盘和面板使用 `config.py` 的默认值。包含学生互动的 lecture、seminar 或多人会议保持默认的完整流程。说话人标签是编号，不代表已核实身份。
 
 在 NVIDIA GPU 上，英文语音用 Parakeet TDT 0.6B v3 识别，比 Whisper 快约 2.5 倍；在一场 69 分钟的 lecture 上，学生提问都保留了。语言为自动检测时，先用一个小 Whisper 模型根据开头几分钟判断语言，英文置信度低于 80% 的仍用 Whisper。中文和其他语言、CPU 运行，以及指定了术语（`--hotwords`）的任务都用 Whisper，因为 Parakeet 不支持提示词。第一次用 Parakeet 会下载约 2.5 GB 到 `%LOCALAPPDATA%/SimpleVideoTranscriber/models/`。在 `config.py` 设 `PARAKEET_FOR_ENGLISH = False` 可始终使用 Whisper。
 
@@ -38,7 +38,7 @@ powershell -ExecutionPolicy Bypass -File setup_autostart.ps1
 powershell -ExecutionPolicy Bypass -File setup_context_menu.ps1
 ```
 
-Obsidian 插件：在 `obsidian-plugin/` 运行 `npm install` 和 `npm run deploy`，产物会复制到 `E:/obsidian-vault/.obsidian/plugins/meeting-transcriber`（用环境变量 `VAULT_PLUGIN_DIR` 指定其他 vault），再在 Obsidian 的第三方插件里启用 Meeting Transcriber。插件通过 `127.0.0.1:47321`（`config.py` 的 `API_PORT`）和托盘通信，每个请求都要带 `%LOCALAPPDATA%/SimpleVideoTranscriber/api_token` 里的密钥，网页无法读取这个文件，所以不能借此往队列里加文件。
+Obsidian 插件：在 `obsidian-plugin/` 运行 `npm install` 和 `npm run deploy`，产物会复制到 `E:/obsidian-vault/.obsidian/plugins/meeting-transcriber`（用环境变量 `VAULT_PLUGIN_DIR` 指定其他 vault），再在 Obsidian 的第三方插件里启用 Meeting Transcriber。托盘把端口和密钥写到 `%LOCALAPPDATA%/SimpleVideoTranscriber/` 的 `api_port` 和 `api_token`，插件读取这两个文件；端口在 `config.py` 的 `API_PORT` 修改。网页无法读取这些文件，所以不能借此往队列里加文件。
 
 面板有排队或运行任务时每 2 秒查询，空闲或服务不可用时每 15 秒查询。面板或文档隐藏时暂停，重新显示时立即刷新。请求超过 10 秒会断开连接；超时的操作不会自动重试，请先查看任务状态再重新提交。鉴权和响应错误会与连接失败分开显示。
 
@@ -53,17 +53,17 @@ python transcribe.py "solo-lecture.m4a" --transcribe-only
 python transcribe.py "meeting.mp4" --diarize-only
 ```
 
-`--diarize-only` 复用匹配当前识别参数的识别缓存；匹配的说话人分离缓存也会复用。失败后重试不需要删除识别缓存。可用 `--model large-v3`、`--device cpu`、`--max-speakers 3`、`--output-dir ./transcripts` 覆盖默认值。Token 可从托盘或插件保存的 Token、`HF_TOKEN` 环境变量或 `config.py` 读取。
+`--diarize-only` 复用匹配当前识别参数的识别缓存；匹配的说话人分离缓存也会复用。失败后重试不需要删除识别缓存。可用 `--model large-v3`、`--device cpu`、`--max-speakers 3`、`--output-dir ./transcripts` 覆盖默认值。HuggingFace Token 使用托盘或插件保存的值，没有时读 `HF_TOKEN` 环境变量。
 
 ## 输出与配置
 
 - `transcripts/`：原始转录稿，供独立的整理流程读取。插件不移动、改写或删除这些文件。Markdown 写入完整后才替换正式文件；写入失败保留已有文件。
 - `cache/`：音频中间文件和识别、分离、合并结果。托盘的“清理音频缓存”只清理与已结束任务关联的音频缓存，保留 JSON 和 Markdown。
-- `%LOCALAPPDATA%/SimpleVideoTranscriber/`：托盘设置、任务数据库、文本日志、本地接口密钥 `api_token` 和 Parakeet 模型。
+- `%LOCALAPPDATA%/SimpleVideoTranscriber/`：托盘设置、任务数据库、文本日志、本地接口的端口和密钥（`api_port`、`api_token`）和 Parakeet 模型。
 
 命令行和托盘任务不能同时处理同一版本的录音。其他任务正在使用它时，转录会报音频缓存被占用，等该任务结束后再重试。清理音频缓存会跳过占用中的 WAV。
 
-`config.py` 提供默认设置；`settings.json` 保存的设置供托盘使用，命令行参数覆盖对应默认值。走 Whisper 的任务默认用 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在托盘菜单修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
+`config.py` 提供所有任务的默认设置，命令行参数覆盖对应默认值。`settings.json` 只保存托盘的监听目录和监听开关。走 Whisper 的任务默认用 `large-v3-turbo`，也可选 `large-v3`；设备默认为 `auto`。监听目录默认为用户 Videos 文件夹，可在托盘菜单修改，或用 `MEETING_TRANSCRIBER_WATCH_DIR` 指定默认值。
 
 任务入队时保存转录设置。缺少 Token 且没有可用分离缓存时提前失败；识别和分离缓存均匹配时，跳过音频提取和模型运行。
 

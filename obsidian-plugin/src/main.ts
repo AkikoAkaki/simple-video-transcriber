@@ -1,11 +1,11 @@
 import { spawn } from "child_process";
 import { access } from "fs/promises";
 import { FileSystemAdapter, FuzzySuggestModal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
+import media from "../../media_extensions.json";
 import { TranscriberApi } from "./api";
 import { TaskView, VIEW_TYPE } from "./view";
 
 interface Settings {
-	port: number;
 	/** Started when the panel finds no running tray. */
 	startScript: string;
 	/** job id -> vault path explicitly associated by the user; legacy archive links remain usable. */
@@ -13,21 +13,19 @@ interface Settings {
 }
 
 const DEFAULTS: Settings = {
-	port: 47321,
 	startScript: "I:\\Projects\\meeting-transcriber\\start.bat",
 	archived: {},
 };
-const MEDIA = new Set(["mp4", "m4a", "mov", "mkv", "webm", "mp3", "wav", "flac", "aac", "opus"]);
+const MEDIA = new Set([...media.audio, ...media.video].map(extension => extension.slice(1)));
 
 export default class MeetingTranscriberPlugin extends Plugin {
 	settings: Settings = { ...DEFAULTS, archived: {} };
-	api = new TranscriberApi(() => this.settings.port);
+	api = new TranscriberApi();
 
 	async onload() {
 		const saved = await this.loadData();
 		const links: unknown = saved?.archived;
 		this.settings = {
-			port: Number.isInteger(saved?.port) && saved.port > 0 && saved.port <= 65535 ? saved.port : DEFAULTS.port,
 			startScript: typeof saved?.startScript === "string" ? saved.startScript : DEFAULTS.startScript,
 			archived: typeof links === "object" && links !== null && !Array.isArray(links)
 				? Object.fromEntries(Object.entries(links).filter(([, path]) => typeof path === "string")) : {},
@@ -103,8 +101,21 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		}
 	}
 
-	linkNote(jobId: string) {
+	/** The organized note the user associated with this job, while it still exists. */
+	linkedNote(jobId: string): TFile | null {
+		const path = this.settings.archived[jobId];
+		const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
+		return file instanceof TFile ? file : null;
+	}
+
+	chooseLinkedNote(jobId: string) {
 		new NoteModal(this, jobId).open();
+	}
+
+	async linkNote(jobId: string, file: TFile) {
+		this.settings.archived[jobId] = file.path;
+		await this.saveSettings();
+		await this.refreshViews();
 	}
 
 	async openPanel() {
@@ -148,16 +159,6 @@ class TranscriberSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		new Setting(containerEl)
-			.setName("服务端口")
-			.setDesc("和转录程序 config.py 里的 API_PORT 一致。")
-			.addText(text => text.setValue(String(this.plugin.settings.port)).onChange(async value => {
-				const port = Number(value);
-				if (Number.isInteger(port) && port > 0 && port <= 65535) {
-					this.plugin.settings.port = port;
-					await this.plugin.saveSettings();
-				}
-			}));
-		new Setting(containerEl)
 			.setName("启动脚本")
 			.setDesc("面板发现转录服务没有运行时，用它启动托盘。")
 			.addText(text => text.setValue(this.plugin.settings.startScript).onChange(async value => {
@@ -193,9 +194,7 @@ class NoteModal extends FuzzySuggestModal<TFile> {
 	getItemText(file: TFile) { return file.path; }
 	async onChooseItem(file: TFile) {
 		try {
-			this.plugin.settings.archived[this.jobId] = file.path;
-			await this.plugin.saveSettings();
-			await this.plugin.refreshViews();
+			await this.plugin.linkNote(this.jobId, file);
 			new Notice(`已关联 ${file.path}`);
 		} catch (error) {
 			new Notice(`关联失败：${String(error)}`);

@@ -5,6 +5,7 @@ Explorer runs ``pythonw enqueue.py <file>`` once per selected file; setup_contex
 
 from __future__ import annotations
 
+import ctypes
 import json
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import api
+import appdata
 import config
 
 TRAY_START_TIMEOUT_SECONDS = 60
@@ -24,24 +25,20 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _post(paths: list[str]) -> dict:
     request = urllib.request.Request(
         f"http://127.0.0.1:{config.API_PORT}/api/jobs", data=json.dumps({"paths": paths}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api.load_secret()}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {appdata.load_api_secret()}", "Content-Type": "application/json"},
         method="POST")
     with _OPENER.open(request, timeout=10) as response:
         return json.loads(response.read())
 
 
 def _start_tray() -> None:
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen([sys.executable, str(Path(__file__).with_name("tray_app.py")), "--background"],
-                     creationflags=flags, close_fds=True)
+                     creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                     close_fds=True)
 
 
 def _alert(message: str) -> None:
-    if sys.platform == "win32":
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(None, message, "Meeting Transcriber", 0x30)
-    else:
-        print(message, file=sys.stderr)
+    ctypes.windll.user32.MessageBoxW(None, message, "Meeting Transcriber", 0x30)
 
 
 def main(argv: list[str]) -> int:

@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Callable
 
-from typography import join_display_text
+from pipeline.typography import join_display_text
 
 
 UNKNOWN_SPEAKER = "[unknown]"
-# Consecutive text from one speaker separated by at most this many seconds is one block.
 MAX_GAP_SECONDS = 2.0
+_MAX_FLICKER_SECONDS = 1.0
 
 
 def format_time(seconds: float) -> str:
@@ -71,7 +71,7 @@ def _join_blocks(run: dict, item: dict) -> str:
     return join_display_text(run["text"], item["text"])
 
 
-def _coalesce_short_speaker_runs(segments: list[dict], max_duration: float = 1.0) -> list[dict]:
+def _coalesce_short_speaker_runs(segments: list[dict]) -> list[dict]:
     """Suppress only high-confidence, short diarization flicker.
 
     A short block takes its neighbours' speaker when every neighbour it has
@@ -81,7 +81,7 @@ def _coalesce_short_speaker_runs(segments: list[dict], max_duration: float = 1.0
     """
     work = [dict(segment) for segment in segments]
     for index, segment in enumerate(work):
-        if segment["end"] - segment["start"] > max_duration:
+        if segment["end"] - segment["start"] > _MAX_FLICKER_SECONDS:
             continue
         sides = [work[i]["speaker"] for i in (index - 1, index + 1) if 0 <= i < len(work)]
         if len(set(sides)) != 1 or sides[0] == UNKNOWN_SPEAKER:
@@ -102,8 +102,6 @@ def _merge_word_timestamps(whisper_segments: list[dict], speaker_turns: list[dic
                           "speaker": speaker, "segment": segment_index})
 
     def join_word(run: dict, word: dict) -> str:
-        # Within one Whisper segment the word keeps its own spacing; a new
-        # segment starts a new display block.
         if run["segment"] == word["segment"]:
             return _append_word_text(run["text"], word["text"])
         return join_display_text(run["text"], word["text"])
@@ -116,8 +114,6 @@ def _merge_word_timestamps(whisper_segments: list[dict], speaker_turns: list[dic
 
 def merge_results(whisper_segments: list[dict], speaker_turns: list[dict]) -> list[dict]:
     """Label recognized text with speakers and merge it into display blocks."""
-    # Word-level timestamps let a single Whisper segment contain multiple
-    # speakers without assigning the entire sentence to one person.
     # A mixed cache (some segments with word timestamps, some without) cannot
     # be safely reconstructed word-by-word without dropping the latter. Use
     # the segment-level path for that case; it preserves all source text.

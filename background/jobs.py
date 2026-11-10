@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, NamedTuple
 
 import appdata
+import config
 from paths import audio_cache_lock, fingerprint, partial_path, source_identity, wav_cache_path
 from protocol import JobOptions
 
@@ -23,25 +24,22 @@ class JobStatus(StrEnum):
     RUNNING = "running"
     CANCEL_REQUESTED = "cancel_requested"
     COMPLETED = "completed"
-    COMPLETED_WITH_WARNING = "completed_with_warning"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-# A job that may still run, or is running, owns its audio cache.
-ACTIVE = frozenset({JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
-# The worker reports these names as its terminal events too.
-TERMINAL = frozenset({JobStatus.COMPLETED, JobStatus.COMPLETED_WITH_WARNING, JobStatus.FAILED, JobStatus.CANCELLED})
-RETRYABLE = frozenset({JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.COMPLETED_WITH_WARNING})
-MAX_RECOVERIES = 5
+_ACTIVE = frozenset({JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED})
+_TERMINAL = frozenset({JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED})
+RETRYABLE = frozenset({JobStatus.FAILED, JobStatus.CANCELLED})
+_MAX_RECOVERIES = 5
 
 
-def now() -> str:
+def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def job_options(row: dict, base: JobOptions | None = None) -> JobOptions:
-    return JobOptions.parse(json.loads(row["options_json"] or "{}"), base)
+def job_options(row: dict) -> JobOptions:
+    return JobOptions.parse(json.loads(row["options_json"] or "{}"))
 
 
 class CacheCleanup(NamedTuple):
@@ -50,8 +48,8 @@ class CacheCleanup(NamedTuple):
 
 
 class JobStore:
-    def __init__(self, path: Path | None = None):
-        self.path = path or appdata.JOBS_DB
+    def __init__(self):
+        self.path = appdata.jobs_db()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_db()
@@ -92,23 +90,20 @@ class JobStore:
                 """
             )
 
-    def create_if_new(self, path: Path, options: JobOptions = JobOptions(), *,
-                      from_watcher: bool = False) -> dict | None:
+    def create_if_new(self, path: Path, options: JobOptions = JobOptions()) -> dict | None:
+        """Queue this version of a recording, re-running it if finished; None if it is already active."""
         try:
             source = source_identity(path)
         except OSError:
             return None
-        stamp = now()
-        # A queued job starts from this state, whether it is new or a re-run of a finished one.
+        stamp = _now()
         fresh = {"status": JobStatus.QUEUED, "stage": JobStatus.QUEUED, "progress": 0.0, "message": "Queued",
                  "output_path": "", "error": "", "updated_at": stamp, "started_at": "", "finished_at": "",
                  "retry_count": 0, "options_json": json.dumps(asdict(options), ensure_ascii=False)}
         with self._connect() as conn:
             existing = conn.execute("SELECT * FROM jobs WHERE source_key = ?", (source.key,)).fetchone()
             if existing:
-                # A stray filesystem event must never re-queue hours of GPU
-                # work and wipe the result pointer; re-runs are retries or imports.
-                if existing["status"] in ACTIVE or from_watcher:
+                if existing["status"] in _ACTIVE:
                     return None
                 row = {**dict(existing), **fresh}
                 conn.execute(f"UPDATE jobs SET {', '.join(f'{key} = ?' for key in fresh)} WHERE job_id = ?",
@@ -124,25 +119,22 @@ class JobStore:
                 return None
         return row
 
-    def update(self, job_id: str, **changes) -> bool:
-        return self._transition(job_id, JobStatus, **changes)
-
     def start(self, job_id: str) -> bool:
         return self._transition(job_id, {JobStatus.QUEUED}, status=JobStatus.RUNNING, stage="starting",
-                                message="Starting worker", started_at=now())
+                                message="Starting worker", started_at=_now())
 
     def request_cancel(self, job_id: str, message: str) -> bool:
         return self._transition(job_id, {JobStatus.QUEUED, JobStatus.RUNNING},
-                                status=JobStatus.CANCEL_REQUESTED, stage="cancelling", message=message)
+                                status=JobStatus.CANCEL_REQUESTED, message=message)
 
     def cancel(self, job_id: str, message: str = "Cancelled") -> bool:
         return self._transition(job_id, {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED},
-                                status=JobStatus.CANCELLED, message=message, finished_at=now())
+                                status=JobStatus.CANCELLED, message=message, finished_at=_now())
 
     def finish(self, job_id: str, status: JobStatus, message: str, **changes) -> JobStatus | None:
         """Record a job's outcome and return the status it ended with; a cancelled job stays cancelled."""
         if self._transition(job_id, {JobStatus.QUEUED, JobStatus.RUNNING},
-                            status=status, message=message, finished_at=now(), **changes):
+                            status=status, message=message, finished_at=_now(), **changes):
             return status
         return JobStatus.CANCELLED if self.cancel(job_id) else None
 
@@ -151,7 +143,7 @@ class JobStore:
 
     def _transition(self, job_id: str, expected: Iterable[JobStatus], **changes) -> bool:
         statuses = tuple(expected)
-        changes["updated_at"] = now()
+        changes["updated_at"] = _now()
         assignments = ", ".join(f"{key} = ?" for key in changes)
         placeholders = ",".join("?" for _ in statuses)
         with self._connect() as conn:
@@ -175,7 +167,7 @@ class JobStore:
         with self._connect() as conn:
             return conn.execute("SELECT 1 FROM jobs WHERE source_key = ?", (key,)).fetchone() is not None
 
-    def recent(self, limit: int = 20) -> list[dict]:
+    def recent(self, limit: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM jobs ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
@@ -193,7 +185,7 @@ class JobStore:
         return [tuple(row) for row in rows]
 
     def recover_interrupted(self) -> None:
-        stamp = now()
+        stamp = _now()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE jobs SET status=?, message='Cancelled during previous shutdown', "
@@ -203,27 +195,27 @@ class JobStore:
             conn.execute(
                 "UPDATE jobs SET status=?, message=?, updated_at=?, finished_at=? "
                 "WHERE status=? AND retry_count >= ?",
-                (JobStatus.FAILED, f"Failed after {MAX_RECOVERIES} recovery retries",
-                 stamp, stamp, JobStatus.RUNNING, MAX_RECOVERIES),
+                (JobStatus.FAILED, f"Failed after {_MAX_RECOVERIES} recovery retries",
+                 stamp, stamp, JobStatus.RUNNING, _MAX_RECOVERIES),
             )
             conn.execute(
                 "UPDATE jobs SET status=?, stage=?, message='Recovered after restart', "
                 "updated_at=?, retry_count=retry_count+1 WHERE status=? AND retry_count < ?",
-                (JobStatus.QUEUED, JobStatus.QUEUED, stamp, JobStatus.RUNNING, MAX_RECOVERIES),
+                (JobStatus.QUEUED, JobStatus.QUEUED, stamp, JobStatus.RUNNING, _MAX_RECOVERIES),
             )
 
 
-def cache_size_bytes(cache_dir: Path) -> int:
+def cache_size_bytes() -> int:
     total = 0
     with suppress(OSError):
-        for entry in cache_dir.iterdir():
+        for entry in config.CACHE_DIR.iterdir():
             with suppress(OSError):
                 if entry.is_file():
                     total += entry.stat().st_size
     return total
 
 
-def clear_audio_cache(cache_dir: Path, store: JobStore) -> CacheCleanup:
+def clear_audio_cache(store: JobStore) -> CacheCleanup:
     """Delete the WAVs, finished or partial, of jobs that reached a terminal status.
 
     Only files named after a terminal job's unique source key are candidates,
@@ -232,8 +224,8 @@ def clear_audio_cache(cache_dir: Path, store: JobStore) -> CacheCleanup:
     """
     guarding_wav: dict[Path, Path] = {}
     for source_path, source_key, status in store.cache_owners():
-        if status in TERMINAL:
-            wav = wav_cache_path(cache_dir, Path(source_path).stem, fingerprint(source_key))
+        if status in _TERMINAL:
+            wav = wav_cache_path(Path(source_path).stem, fingerprint(source_key))
             guarding_wav.update({wav: wav, partial_path(wav): wav})
 
     deleted_count = 0

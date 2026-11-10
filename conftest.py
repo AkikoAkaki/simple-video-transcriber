@@ -25,15 +25,12 @@ def pytest_collection_modifyitems(items):
 def isolated_state(tmp_path, monkeypatch):
     import appdata
     import config
-    import models
+    from pipeline.models import release_models
 
-    for name, leaf in (("APP_DATA_DIR", "appdata"), ("SETTINGS_FILE", "settings.json"),
-                       ("JOBS_DB", "jobs.sqlite3"), ("TOKEN_FILE", "token.txt"), ("LOG_DIR", "logs")):
-        monkeypatch.setattr(appdata, name, tmp_path / leaf)
+    monkeypatch.setattr(appdata, "APP_DATA_DIR", tmp_path / "appdata")
     monkeypatch.setattr(config, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(config, "TRANSCRIPT_DIR", tmp_path / "transcripts")
-    monkeypatch.setattr(config, "HF_TOKEN", "")
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr(appdata.TokenStore, "get", lambda self: "test-token")
     yield
-    models.release_models()
+    release_models()

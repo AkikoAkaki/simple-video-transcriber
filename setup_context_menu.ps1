@@ -8,8 +8,8 @@ param([switch]$Uninstall)
 
 $ErrorActionPreference = "Stop"
 
-# .ts is left out: on a developer machine it is far more often TypeScript than a video stream.
-$extensions = @(".mp4", ".m4a", ".mov", ".mkv", ".webm", ".mp3", ".wav", ".flac", ".aac", ".opus")
+$media = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot "media_extensions.json") | ConvertFrom-Json
+$extensions = @($media.audio) + @($media.video)
 $verb = "MeetingTranscriber"
 
 if ($Uninstall) {
