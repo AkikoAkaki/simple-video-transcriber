@@ -6,17 +6,19 @@ from pathlib import Path
 
 import pytest
 
-import api
 import appdata
-import service
+import config
+from background.api import ApiServer
+from background.service import BackgroundService
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def test_api_queues_each_recording_once_and_only_with_the_secret(tmp_path):
-    svc = service.BackgroundService(appdata.AppSettings(
-        watch_dir=str(tmp_path / "watch"), transcript_dir=str(tmp_path / "out"), watcher_enabled=False))
-    server = api.ApiServer(svc, port=0)
+def test_api_queues_each_recording_once_and_only_with_the_secret(tmp_path, monkeypatch):
+    appdata.AppSettings(watch_dir=str(tmp_path / "watch"), watcher_enabled=False).save()
+    monkeypatch.setattr(config, "API_PORT", 0)
+    svc = BackgroundService(lambda _event, _payload: None)
+    server = ApiServer(svc)
     server.start()
 
     def call(route, body=None, secret=""):
@@ -34,7 +36,7 @@ def test_api_queues_each_recording_once_and_only_with_the_secret(tmp_path):
         with pytest.raises(urllib.error.HTTPError) as denied:
             call("/api/jobs", posted, secret="guess")
         assert denied.value.code == 401 and svc.store.queued() == []
-        secret = api.load_secret()
+        secret = appdata.load_api_secret()
         assert len(call("/api/jobs", posted, secret)["queued"]) == 2
         assert sorted(Path(row["source_path"]).name for row in svc.store.queued()) == ["first.m4a", "second.mp4"]
         state = call("/api/state", secret=secret)

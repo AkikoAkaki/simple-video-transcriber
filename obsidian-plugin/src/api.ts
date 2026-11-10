@@ -8,25 +8,22 @@ export class ApiError extends Error {
 	}
 }
 
-export interface Job {
-	job_id: string;
-	source_path: string;
-	status: string;
-	stage: string;
-	progress: number | null;
-	message: string;
-	output_path: string;
-	error: string;
-	created_at: string;
-	finished_at: string;
-}
+const JOB_TEXT_FIELDS = ["job_id", "source_path", "message", "output_path", "error", "created_at", "finished_at"] as const;
+
+/** Mirrors the job fields in background/api.py. */
+export type Job = Record<(typeof JOB_TEXT_FIELDS)[number], string> & {
+	status: "queued" | "running" | "cancel_requested" | "completed" | "failed" | "cancelled";
+	overall_progress: number;
+	step: number;
+	retryable: boolean;
+};
 
 export interface ServiceState {
 	active: Job | null;
 	recent: Job[];
 	offered: string[];
 	watcher: { enabled: boolean; dir: string };
-	transcript_dir: string;
+	steps: string[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -35,9 +32,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isJob(value: unknown): value is Job {
 	return isRecord(value)
-		&& ["job_id", "source_path", "status", "stage", "message", "output_path", "error", "created_at", "finished_at"]
-			.every(key => typeof value[key] === "string")
-		&& (value.progress === null || (typeof value.progress === "number" && Number.isFinite(value.progress)));
+		&& JOB_TEXT_FIELDS.every(key => typeof value[key] === "string") && typeof value.status === "string"
+		&& typeof value.overall_progress === "number" && Number.isFinite(value.overall_progress)
+		&& typeof value.step === "number" && typeof value.retryable === "boolean";
 }
 
 function isState(value: unknown): value is ServiceState {
@@ -45,27 +42,26 @@ function isState(value: unknown): value is ServiceState {
 		&& Array.isArray(value.recent) && value.recent.every(isJob)
 		&& Array.isArray(value.offered) && value.offered.every(path => typeof path === "string")
 		&& isRecord(value.watcher) && typeof value.watcher.enabled === "boolean" && typeof value.watcher.dir === "string"
-		&& typeof value.transcript_dir === "string";
+		&& Array.isArray(value.steps) && value.steps.every(step => typeof step === "string");
 }
 
-/** The tray writes this secret when it starts; a request without it is rejected. */
-async function readSecret(): Promise<string> {
+/** A value the tray publishes in its app data folder when it starts. */
+async function readPublished(name: string): Promise<string> {
 	try {
-		return (await readFile(join(process.env.LOCALAPPDATA ?? "", "SimpleVideoTranscriber", "api_token"), "utf8")).trim();
+		return (await readFile(join(process.env.LOCALAPPDATA ?? "", "SimpleVideoTranscriber", name), "utf8")).trim();
 	} catch {
 		return "";
 	}
 }
 
-/** Client for the tray's local API (api.py). Throws when the tray is not running. */
+/** Client for the tray's local API (background/api.py). Throws when the tray is not running. */
 export class TranscriberApi {
-	constructor(private readonly port: () => number) {}
-
 	private async call(method: "GET" | "POST", route: string, body?: unknown): Promise<unknown> {
-		const secret = await readSecret();
+		const [secret, port] = await Promise.all([readPublished("api_token"), readPublished("api_port")]);
+		if (!port) throw new ApiError("转录服务还没有启动过", "connection");
 		const data = body === undefined ? undefined : JSON.stringify(body);
 		const response = await new Promise<{ status: number; text: string }>((resolve, reject) => {
-			const req = request({ hostname: "127.0.0.1", port: this.port(), path: route, method,
+			const req = request({ hostname: "127.0.0.1", port: Number(port), path: route, method,
 				headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json",
 					...(data === undefined ? {} : { "Content-Length": Buffer.byteLength(data) }) },
 			}, res => {

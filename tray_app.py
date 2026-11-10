@@ -7,6 +7,7 @@ The tray process stays light: it imports no Torch or ML package. The heavy work 
 
 from __future__ import annotations
 
+import ctypes
 import sys
 from pathlib import Path
 
@@ -16,15 +17,15 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit
 
 import appdata
 import config
-from api import ApiServer
-from service import BackgroundService
+from background.api import ApiServer
+from background.service import BackgroundService
+from protocol import overall_progress
 
 BLUE, GREEN, RED = "#3b82f6", "#22c55e", "#ef4444"
 # Opens the task panel of the Obsidian plugin, which registers this URI.
 PANEL_URI = "obsidian://meeting-transcriber"
 MEDIA_FILTER = "音视频 (" + " ".join(f"*{ext}" for ext in sorted(config.WATCH_EXTENSIONS)) + ")"
-_ICON_FOR_EVENT = {"queued": BLUE, "started": BLUE, "stage": BLUE, "completed": GREEN,
-                   "completed_with_warning": GREEN, "failed": RED, "watch_error": RED}
+_ICON_FOR_EVENT = {"queued": BLUE, "started": BLUE, "stage": BLUE, "completed": GREEN, "failed": RED, "watch_error": RED}
 
 
 def _format_size(num_bytes: int) -> str:
@@ -60,6 +61,10 @@ def _open(target: str) -> None:
     QDesktopServices.openUrl(url)
 
 
+def _open_panel() -> None:
+    _open(PANEL_URI)
+
+
 class TrayApp(QObject):
     event_received = Signal(str, object)
 
@@ -72,7 +77,7 @@ class TrayApp(QObject):
         self.api: ApiServer | None = None
         self.tray = QSystemTrayIcon(_make_icon(), qt_app)
         # A notification can only be clicked as a whole, so remember what the latest one offers.
-        self._on_message_click = lambda: _open(PANEL_URI)
+        self._on_message_click = _open_panel
         self.menu = QMenu()
         self.menu.aboutToShow.connect(self._fill_menu)
         self.tray.setContextMenu(self.menu)
@@ -97,7 +102,7 @@ class TrayApp(QObject):
 
     def _activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
-            _open(PANEL_URI)
+            _open_panel()
 
     def _fill_menu(self) -> None:
         """Rebuilt on every open, so it always shows the current task and waiting recordings."""
@@ -105,18 +110,18 @@ class TrayApp(QObject):
         menu.clear()
         active = service.active_job()
         if active:
-            row = service.get_job(active["job_id"]) or active
-            progress = f"（{row['progress']:.0%}）" if row.get("progress") else ""
-            menu.addAction(f"正在转录：{Path(row['source_path']).name}{progress}").setEnabled(False)
+            overall = overall_progress(active["stage"], active["progress"])
+            progress = f"（{overall:.0%}）" if overall else ""
+            menu.addAction(f"正在转录：{Path(active['source_path']).name}{progress}").setEnabled(False)
         else:
             menu.addAction("空闲").setEnabled(False)
-        menu.addAction("打开任务面板（Obsidian）", lambda: _open(PANEL_URI))
+        menu.addAction("打开任务面板（Obsidian）", _open_panel)
         menu.addAction("转录文件…", self._choose_files)
         offered = service.offered_recordings()
         if offered:
             recordings = menu.addMenu(f"新录屏（{len(offered)}）")
             for path in offered:
-                recordings.addAction(Path(path).name, lambda p=path: self._accept(p))
+                recordings.addAction(Path(path).name, lambda p=path: service.accept_recording(p))
             recordings.addSeparator()
             recordings.addAction("全部忽略", lambda: [service.dismiss_recording(p) for p in offered])
         menu.addAction("取消当前任务", service.cancel_active).setEnabled(bool(active))
@@ -128,21 +133,15 @@ class TrayApp(QObject):
         menu.addAction("设置 HuggingFace Token…", self._set_token)
         menu.addAction("清理音频缓存…", self._clear_audio_cache)
         menu.addSeparator()
-        menu.addAction("打开转录文件夹", lambda: _open(service.settings.transcript_dir))
-        menu.addAction("打开日志文件夹", lambda: _open(str(appdata.LOG_DIR)))
+        menu.addAction("打开转录文件夹", lambda: _open(str(config.TRANSCRIPT_DIR)))
+        menu.addAction("打开日志文件夹", lambda: _open(str(appdata.log_dir())))
         menu.addAction("退出", self.quit)
 
     def _choose_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(None, "选择要转录的录音", str(Path.home() / "Downloads"), MEDIA_FILTER)
         if paths:
             rows = self.service.add_files(paths)
-            self._notify("已加入队列", f"{len(rows)} 个文件等待转录", lambda: _open(PANEL_URI))
-
-    def _accept(self, path: str) -> None:
-        try:
-            self.service.accept_recording(path)
-        except ValueError:
-            pass
+            self._notify("已加入队列", f"{len(rows)} 个文件等待转录", _open_panel)
 
     def _set_watching(self, enabled: bool) -> None:
         self.service.set_watcher_enabled(enabled)
@@ -177,12 +176,11 @@ class TrayApp(QObject):
         name = Path((job or {}).get("source_path") or payload.get("path") or "").name
         if event == "recording_ready":
             path = payload["path"]
-            self._notify("发现新录屏", f"{name}\n点击开始转录", lambda: self._accept(path))
-        elif event in ("completed", "completed_with_warning"):
-            self._notify("转录完成", f"{name or payload.get('message', '')}\n点击打开任务面板",
-                         lambda: _open(PANEL_URI))
+            self._notify("发现新录屏", f"{name}\n点击开始转录", lambda: self.service.accept_recording(path))
+        elif event == "completed":
+            self._notify("转录完成", f"{name or payload.get('message', '')}\n点击打开任务面板", _open_panel)
         elif event == "failed":
-            self._notify("转录失败", payload.get("error") or payload.get("message", ""), lambda: _open(PANEL_URI),
+            self._notify("转录失败", payload.get("error") or payload.get("message", ""), _open_panel,
                          QSystemTrayIcon.MessageIcon.Critical)
         self._update_tooltip()
 
@@ -209,15 +207,10 @@ class TrayApp(QObject):
 
 
 def main() -> int:
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            desktop = user32.OpenDesktopW("Default", 0, False, 0x01FF)
-            if desktop:
-                user32.SetThreadDesktop(desktop)
-        except Exception:
-            pass
+    user32 = ctypes.windll.user32
+    desktop = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if desktop:
+        user32.SetThreadDesktop(desktop)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     controller = TrayApp(app)

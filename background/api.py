@@ -1,7 +1,9 @@
 """Local HTTP API through which the Obsidian plugin and the Explorer menu drive the background service.
 
-It listens on 127.0.0.1 only, and every request must carry the secret stored in ``api_token`` in the
-app data folder. A web page can reach localhost, but it cannot read that file, so it cannot queue files.
+It listens on 127.0.0.1 only, and every request must carry the secret from ``appdata.load_api_secret``.
+A web page can reach localhost, but it cannot read that file, so it cannot queue files.
+
+The Job fields here are mirrored by obsidian-plugin/src/api.ts.
 """
 
 from __future__ import annotations
@@ -9,45 +11,37 @@ from __future__ import annotations
 import hmac
 import json
 import re
-import secrets
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import appdata
 import config
+from background.jobs import RETRYABLE
+from protocol import STEP_LABELS, overall_progress, step_of
 
-_JOB_FIELDS = ("job_id", "source_path", "status", "stage", "progress", "message", "output_path", "error",
+_JOB_FIELDS = ("job_id", "source_path", "status", "message", "output_path", "error",
                "created_at", "finished_at")
 _MAX_BODY = 1 << 20
-
-
-def load_secret(create: bool = False) -> str:
-    path = appdata.APP_DATA_DIR / "api_token"
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        value = ""
-    if not value and create:
-        value = secrets.token_urlsafe(32)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
-    return value
+_RECENT_JOBS = 20
 
 
 def _job(row: dict | None) -> dict | None:
-    return {name: row.get(name) for name in _JOB_FIELDS} if row else None
+    if not row:
+        return None
+    return {**{name: row.get(name) for name in _JOB_FIELDS},
+            "overall_progress": overall_progress(row["stage"], row["progress"]),
+            "step": step_of(row["stage"]),
+            "retryable": row["status"] in RETRYABLE}
 
 
 def snapshot(service) -> dict:
-    active = service.active_job()
     return {
-        # The worker's copy of the active row is stale; the store has its latest progress.
-        "active": _job(service.get_job(active["job_id"]) if active else None),
-        "recent": [_job(row) for row in service.recent_jobs(20)],
+        "active": _job(service.active_job()),
+        "recent": [_job(row) for row in service.recent_jobs(_RECENT_JOBS)],
         "offered": service.offered_recordings(),
         "watcher": {"enabled": service.settings.watcher_enabled, "dir": service.settings.watch_dir},
-        "transcript_dir": service.settings.transcript_dir,
+        "steps": STEP_LABELS,
     }
 
 
@@ -62,7 +56,7 @@ def _routes(service) -> dict:
         ("POST", r"/api/cancel"): lambda body: service.cancel_active() or {},
         ("POST", r"/api/recordings/accept"): lambda body: queued(service.accept_recording(str(body.get("path", "")))),
         ("POST", r"/api/recordings/dismiss"): lambda body: service.dismiss_recording(str(body.get("path", ""))) or {},
-        ("POST", r"/api/watcher"): lambda body: service.set_watcher_enabled(bool(body.get("enabled"))) or snapshot(service),
+        ("POST", r"/api/watcher"): lambda body: service.set_watcher_enabled(bool(body.get("enabled"))) or {},
         ("POST", r"/api/token"): lambda body: service.set_token(str(body.get("token", ""))) or {},
     }
 
@@ -112,9 +106,9 @@ def _handler(service, secret: str):
 
 
 class ApiServer:
-    def __init__(self, service, port: int | None = None):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", config.API_PORT if port is None else port),
-                                         _handler(service, load_secret(create=True)))
+    def __init__(self, service):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", config.API_PORT),
+                                         _handler(service, appdata.load_api_secret(create=True)))
         self.httpd.daemon_threads = True
         self._thread = threading.Thread(target=self.httpd.serve_forever, name="local-api", daemon=True)
 
@@ -123,6 +117,7 @@ class ApiServer:
         return self.httpd.server_address[1]
 
     def start(self) -> None:
+        appdata.publish_api_port(self.port)
         self._thread.start()
 
     def stop(self) -> None:

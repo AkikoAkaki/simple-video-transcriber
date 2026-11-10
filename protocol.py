@@ -6,28 +6,52 @@ Both sides import this module, so it must stay free of ML and Qt imports.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields, replace
-from typing import Literal, get_args
+from dataclasses import asdict, dataclass, fields, replace
+from typing import Literal, NamedTuple, get_args
 
 import config
 
 
 EVENT_PREFIX = "@@EVENT "
 SERVER_READY = "SERVER_READY"
+EVENT_COMPLETED = "completed"
+EVENT_FAILED = "failed"
 DEVICES = ("auto", "cuda", "cpu")
 Mode = Literal["full", "transcribe", "diarize"]
 
-STAGE_STEPS = {
-    "converting": 1, "loading_whisper": 2, "transcribing": 2,
-    "loading_diarization": 3, "diarizing": 3, "merging": 4, "writing": 4,
+
+class Stage(NamedTuple):
+    step: int
+    start: float
+    end: float
+
+
+STEP_LABELS = ("转换", "识别 · 分离", "合并写出")
+STAGES = {
+    "queued": Stage(0, 0.0, 0.0),
+    "starting": Stage(0, 0.0, 0.02),
+    "converting": Stage(0, 0.02, 0.1),
+    "loading_whisper": Stage(1, 0.1, 0.12),
+    "transcribing": Stage(1, 0.12, 0.85),
+    "loading_diarization": Stage(1, 0.85, 0.85),
+    "diarizing": Stage(1, 0.85, 0.9),
+    "merging": Stage(2, 0.9, 0.95),
+    "writing": Stage(2, 0.95, 1.0),
+    "completed": Stage(2, 1.0, 1.0),
 }
-STAGE_COUNT = max(STAGE_STEPS.values())
-_ERROR_MARKERS = ("error", "traceback", "could not load", "cannot load", "invalid handle", "fatal")
 
 
-def looks_like_error(line: str) -> bool:
-    lower = line.lower()
-    return any(marker in lower for marker in _ERROR_MARKERS)
+def step_of(stage: str) -> int:
+    return STAGES[stage].step if stage in STAGES else 0
+
+
+def overall_progress(stage: str, progress: float | None) -> float:
+    """Map a stage's own 0–1 progress onto one bar for the whole job."""
+    fraction = max(0.0, min(1.0, progress or 0.0))
+    if stage not in STAGES:
+        return fraction
+    span = STAGES[stage]
+    return span.start + (span.end - span.start) * fraction
 
 
 def format_event(record: dict) -> str:
@@ -51,9 +75,9 @@ class JobOptions:
     model: str = config.WHISPER_MODEL
     device: str = config.DEVICE
     language: str | None = config.LANGUAGE
-    max_speakers: int | None = config.MAX_SPEAKERS
-    num_speakers: int | None = config.NUM_SPEAKERS
-    hotwords: str = config.HOTWORDS
+    max_speakers: int | None = None
+    num_speakers: int | None = None
+    hotwords: str = ""
     mode: Mode = "full"
     title: str = ""
 
@@ -70,10 +94,10 @@ class JobOptions:
                 raise ValueError(f"Speaker count must be a positive integer: {count}")
 
     @classmethod
-    def parse(cls, data: dict, base: JobOptions | None = None) -> JobOptions:
-        """Build options from worker JSON, CLI values or a saved row.
+    def parse(cls, data: dict) -> JobOptions:
+        """Build options from CLI values or a saved row, which may predate some fields.
 
-        Missing fields come from ``base``; "auto" means "let the model decide".
+        Missing fields take their defaults; "auto" means "let the model decide".
         """
         values = {f.name: data[f.name] for f in fields(cls) if f.name in data}
         for name in ("language", "max_speakers", "num_speakers"):
@@ -86,4 +110,24 @@ class JobOptions:
             values["hotwords"] = values["hotwords"] or ""
         if "title" in values:
             values["title"] = " ".join(str(values["title"] or "").split())
-        return replace(base or cls(), **values)
+        return replace(cls(), **values)
+
+
+@dataclass(frozen=True)
+class JobRequest:
+    """One transcription for the worker: what the CLI and the service both hand to a job."""
+
+    job_id: str
+    input_path: str
+    output_dir: str
+    options: JobOptions
+    token: str = ""
+    source_fingerprint: str | None = None
+
+    def to_line(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_line(cls, line: str) -> JobRequest:
+        data = json.loads(line)
+        return cls(**{**data, "options": JobOptions.parse(data["options"])})

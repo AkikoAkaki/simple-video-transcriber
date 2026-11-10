@@ -1,5 +1,6 @@
-import { basename } from "path";
-import { ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { basename, extname } from "path";
+import { ItemView, Menu, Notice, WorkspaceLeaf, setIcon } from "obsidian";
+import media from "../../media_extensions.json";
 import { ApiError, type Job, type ServiceState } from "./api";
 import type MeetingTranscriberPlugin from "./main";
 
@@ -9,39 +10,7 @@ const IDLE_POLL_MS = 15000;
 const LEAVE_MS = 160;
 const DONE_LIMIT = 8;
 
-const STATUS: Record<string, string> = {
-	queued: "排队中",
-	running: "转录中",
-	cancel_requested: "正在取消",
-	completed: "完成",
-	completed_with_warning: "完成（有警告）",
-	failed: "失败",
-	cancelled: "已取消",
-};
-const RETRYABLE = new Set(["failed", "cancelled", "completed_with_warning"]);
-const DONE = new Set(["completed", "completed_with_warning"]);
-const VIDEO = /\.(mp4|mkv|mov|avi|webm|flv)$/i;
-
-/** Each worker stage reports its own 0–1 progress; map it onto one bar for the whole job. */
-const STAGE_SPAN: Record<string, [number, number]> = {
-	queued: [0, 0],
-	starting: [0, 0.02],
-	converting: [0.02, 0.1],
-	loading_whisper: [0.1, 0.12],
-	transcribing: [0.12, 0.85],
-	diarizing: [0.85, 0.9],
-	merging: [0.9, 0.95],
-	writing: [0.95, 1],
-	completed: [1, 1],
-};
-const STEPS = ["转换", "识别 · 分离", "合并写出"];
-const STEP_OF: Record<string, number> = { converting: 0, loading_whisper: 1, transcribing: 1, diarizing: 1, merging: 2, writing: 2, completed: 2 };
-
-function overall(job: Job): number {
-	const span = STAGE_SPAN[job.stage];
-	const p = Math.max(0, Math.min(1, job.progress ?? 0));
-	return span ? span[0] + (span[1] - span[0]) * p : p;
-}
+const VIDEO = new Set(media.video);
 
 function when(iso: string): string {
 	if (!iso) return "";
@@ -54,6 +23,20 @@ function icon(parent: HTMLElement, name: string, cls = "mt-tile"): HTMLElement {
 	const el = parent.createSpan({ cls });
 	setIcon(el, name);
 	return el;
+}
+
+/** The file a job came from, with its full path on hover. */
+function fileName(parent: HTMLElement, path: string, cls = "mt-name"): void {
+	parent.createDiv({ cls, text: basename(path), attr: { title: path } });
+}
+
+/** The icon and file name that open every full-size card. */
+function cardTop(card: HTMLElement, iconName: string, path: string, tile = "mt-tile"): { top: HTMLElement; info: HTMLElement } {
+	const top = card.createDiv({ cls: "mt-top" });
+	icon(top, iconName, tile);
+	const info = top.createDiv({ cls: "mt-info" });
+	fileName(info, path);
+	return { top, info };
 }
 
 function button(parent: HTMLElement, text: string, opts: { icon?: string; primary?: boolean; ghost?: boolean } = {}): HTMLButtonElement {
@@ -73,7 +56,6 @@ export class TaskView extends ItemView {
 	private sections: Record<string, HTMLElement> = {};
 	// Each section re-renders only when its data changes, so a click is never lost to a redraw.
 	private shown: Record<string, string> = {};
-	// Cards seen in an earlier draw; only new ones play the entrance animation.
 	private seen = new Set<string>();
 	private primed = false;
 	private activeId: string | null = null;
@@ -116,6 +98,7 @@ export class TaskView extends ItemView {
 		const root = this.contentEl;
 		root.empty();
 		root.addClass("mt-view");
+		root.style.setProperty("--mt-leave", `${LEAVE_MS}ms`);
 		for (const name of ["service", "active", "need", "done", "watcher"]) {
 			this.sections[name] = root.createDiv({ cls: `mt-section mt-${name}` });
 		}
@@ -126,7 +109,6 @@ export class TaskView extends ItemView {
 		this.halt();
 	}
 
-	/** Stops polling and discards any response still in flight. */
 	private halt() {
 		this.opened = false;
 		this.generation++;
@@ -171,13 +153,12 @@ export class TaskView extends ItemView {
 		}
 		const recent = state.recent.filter(job => job.job_id !== state.active?.job_id);
 		const queued = recent.filter(job => job.status === "queued");
-		const todo = recent.filter(job => DONE.has(job.status) && !this.linkedNote(job));
+		const todo = recent.filter(job => job.status === "completed" && !this.plugin.linkedNote(job.job_id));
 		const failed = recent.filter(job => job.status === "failed");
-		const done = recent.filter(job => (DONE.has(job.status) && this.linkedNote(job)) || job.status === "cancelled");
-		const archived = this.plugin.settings.archived;
-		this.drawActive(state.active, queued);
+		const done = recent.filter(job => (job.status === "completed" && this.plugin.linkedNote(job.job_id)) || job.status === "cancelled");
+		this.drawActive(state.active, queued, state.steps);
 		this.draw("need", JSON.stringify([state.offered, todo, failed]), el => this.drawNeed(el, state.offered, todo, failed));
-		this.draw("done", JSON.stringify([done.slice(0, DONE_LIMIT), done.map(job => archived[job.job_id])]),
+		this.draw("done", JSON.stringify([done.slice(0, DONE_LIMIT), done.map(job => this.plugin.linkedNote(job.job_id)?.path)]),
 			el => this.drawDone(el, done.slice(0, DONE_LIMIT)));
 		this.draw("watcher", JSON.stringify(state.watcher), el => this.drawWatcher(el, state.watcher));
 		this.primed = true;
@@ -191,7 +172,6 @@ export class TaskView extends ItemView {
 		this.shown[name] = key;
 	}
 
-	/** Marks a card for the entrance animation the first time it appears. */
 	private card(parent: HTMLElement, key: string, cls: string): HTMLElement {
 		const fresh = this.primed && !this.seen.has(key);
 		this.seen.add(key);
@@ -240,26 +220,21 @@ export class TaskView extends ItemView {
 	}
 
 	/** The running job updates in place, so its bar moves instead of the card re-entering every poll. */
-	private drawActive(job: Job | null, queued: Job[]) {
+	private drawActive(job: Job | null, queued: Job[], steps: string[]) {
 		const el = this.sections.active;
 		const queueKey = JSON.stringify(queued.map(q => q.job_id));
 		if (job && job.job_id === this.activeId && this.shown.active === queueKey) {
-			this.updateActive(el, job);
+			this.updateActive(el, job, steps);
 			return;
 		}
 		el.empty();
 		this.activeId = job?.job_id ?? null;
 		this.shown.active = queueKey;
-		if (!job) {
-			if (!queued.length) return;
-		}
+		if (!job && !queued.length) return;
 		el.createDiv({ cls: "mt-label", text: job ? (queued.length ? `正在转录 · 之后还有 ${queued.length} 个` : "正在转录") : "排队中" });
 		if (job) {
 			const card = this.card(el, job.job_id, "mt-card mt-hero");
-			const top = card.createDiv({ cls: "mt-top" });
-			icon(top, VIDEO.test(job.source_path) ? "film" : "mic");
-			const info = top.createDiv({ cls: "mt-info" });
-			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			const { top, info } = cardTop(card, VIDEO.has(extname(job.source_path).toLowerCase()) ? "film" : "mic", job.source_path);
 			const sub = info.createDiv({ cls: "mt-sub" });
 			sub.createSpan({ cls: "mt-stage" });
 			sub.createSpan({ text: " · " });
@@ -267,30 +242,29 @@ export class TaskView extends ItemView {
 			const cancel = iconButton(top, "square", "取消");
 			cancel.onclick = () => this.act(() => this.plugin.api.cancel());
 			card.createDiv({ cls: "mt-bar" }).createDiv({ cls: "mt-bar-fill" });
-			const steps = card.createDiv({ cls: "mt-steps" });
-			STEPS.forEach(step => steps.createSpan({ text: step }));
-			this.updateActive(el, job);
+			const stepRow = card.createDiv({ cls: "mt-steps" });
+			steps.forEach(step => stepRow.createSpan({ text: step }));
+			this.updateActive(el, job, steps);
 		}
 		for (const q of queued) {
 			const row = this.card(el, q.job_id, "mt-card mt-slim");
 			icon(row, "clock", "mt-tile is-plain");
-			row.createDiv({ cls: "mt-name is-light", text: basename(q.source_path), attr: { title: q.source_path } });
+			fileName(row, q.source_path, "mt-name is-light");
 			row.createSpan({ cls: "mt-mono mt-faint", text: "排队中" });
 		}
 	}
 
-	private updateActive(el: HTMLElement, job: Job) {
-		const p = overall(job);
+	private updateActive(el: HTMLElement, job: Job, steps: string[]) {
+		const p = job.overall_progress;
 		const fill = el.querySelector<HTMLElement>(".mt-bar-fill");
 		if (fill) fill.style.transform = `scaleX(${p})`;
 		const stage = el.querySelector(".mt-stage");
-		if (stage) stage.textContent = job.status === "cancel_requested" ? STATUS.cancel_requested : STEPS[STEP_OF[job.stage] ?? 0];
+		if (stage) stage.textContent = job.status === "cancel_requested" ? "正在取消" : steps[job.step];
 		const pct = el.querySelector(".mt-pct");
 		if (pct) pct.textContent = `${Math.round(p * 100)}%`;
-		const current = STEP_OF[job.stage] ?? 0;
 		el.querySelectorAll(".mt-steps span").forEach((step, i) => {
-			step.toggleClass("is-past", i < current);
-			step.toggleClass("is-now", i === current);
+			step.toggleClass("is-past", i < job.step);
+			step.toggleClass("is-now", i === job.step);
 		});
 	}
 
@@ -300,10 +274,7 @@ export class TaskView extends ItemView {
 		el.createDiv({ cls: "mt-label", text: `需要你处理 · ${count}` });
 		for (const path of offered) {
 			const card = this.card(el, `offer:${path}`, "mt-card");
-			const top = card.createDiv({ cls: "mt-top" });
-			icon(top, "film");
-			const info = top.createDiv({ cls: "mt-info" });
-			info.createDiv({ cls: "mt-name", text: basename(path), attr: { title: path } });
+			const { top, info } = cardTop(card, "film", path);
 			info.createDiv({ cls: "mt-sub", text: "OBS 新录屏" });
 			top.createSpan({ cls: "mt-chip is-warn", text: "新" });
 			const acts = card.createDiv({ cls: "mt-acts" });
@@ -312,28 +283,20 @@ export class TaskView extends ItemView {
 		}
 		for (const job of todo) {
 			const card = this.card(el, job.job_id, "mt-card");
-			const top = card.createDiv({ cls: "mt-top" });
-			icon(top, "file-text");
-			const info = top.createDiv({ cls: "mt-info" });
-			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			const { top, info } = cardTop(card, "file-text", job.source_path);
 			info.createDiv({ cls: "mt-sub", text: `${when(job.finished_at || job.created_at)} 转完` });
-			const warned = job.status === "completed_with_warning";
-			top.createSpan({ cls: `mt-chip${warned ? " is-warn" : ""}`, text: warned ? "有警告" : "待整理", attr: warned && job.error ? { title: job.error } : {} });
+			top.createSpan({ cls: "mt-chip", text: "待整理" });
 			const acts = card.createDiv({ cls: "mt-acts" });
 			if (job.output_path) {
 				const copy = button(acts, "复制整理命令", { icon: "copy", primary: true });
 				copy.onclick = () => this.copy(copy, job.output_path);
 			}
-			button(acts, "关联整理稿").onclick = () => this.plugin.linkNote(job.job_id);
-			iconButton(acts, "more-horizontal", "更多").onclick = event => this.menu(job).showAtMouseEvent(event);
-			card.oncontextmenu = event => { event.preventDefault(); this.menu(job).showAtMouseEvent(event); };
+			button(acts, "关联整理稿").onclick = () => this.plugin.chooseLinkedNote(job.job_id);
+			this.attachMenu(card, acts, job);
 		}
 		for (const job of failed) {
 			const card = this.card(el, job.job_id, "mt-card");
-			const top = card.createDiv({ cls: "mt-top" });
-			icon(top, "alert-circle", "mt-tile is-bad");
-			const info = top.createDiv({ cls: "mt-info" });
-			info.createDiv({ cls: "mt-name", text: basename(job.source_path), attr: { title: job.source_path } });
+			const { top, info } = cardTop(card, "alert-circle", job.source_path, "mt-tile is-bad");
 			info.createDiv({ cls: "mt-sub mt-error", text: job.error || job.message, attr: { title: job.error || job.message } });
 			top.createSpan({ cls: "mt-chip is-bad", text: "失败" });
 			const acts = card.createDiv({ cls: "mt-acts" });
@@ -351,36 +314,34 @@ export class TaskView extends ItemView {
 			const row = this.card(el, job.job_id, "mt-card mt-slim");
 			const cancelled = job.status === "cancelled";
 			icon(row, cancelled ? "x" : "check", `mt-tile is-plain${cancelled ? "" : " is-ok"}`);
-			row.createDiv({ cls: "mt-name is-light", text: basename(job.source_path), attr: { title: job.source_path } });
+			fileName(row, job.source_path, "mt-name is-light");
 			row.createSpan({ cls: "mt-mono mt-faint", text: cancelled ? "已取消" : when(job.finished_at || job.created_at).slice(0, 5) });
-			const note = this.linkedNote(job);
+			const note = this.plugin.linkedNote(job.job_id);
 			if (note) iconButton(row, "external-link", "打开整理稿").onclick = () => this.app.workspace.getLeaf(false).openFile(note);
-			iconButton(row, "more-horizontal", "更多").onclick = event => this.menu(job).showAtMouseEvent(event);
-			row.oncontextmenu = event => { event.preventDefault(); this.menu(job).showAtMouseEvent(event); };
+			this.attachMenu(row, row, job);
 		}
+	}
+
+	/** Offers a job's actions from a "more" button and from right-clicking its card. */
+	private attachMenu(card: HTMLElement, buttonParent: HTMLElement, job: Job) {
+		iconButton(buttonParent, "more-horizontal", "更多").onclick = event => this.menu(job).showAtMouseEvent(event);
+		card.oncontextmenu = event => { event.preventDefault(); this.menu(job).showAtMouseEvent(event); };
 	}
 
 	private menu(job: Job): Menu {
 		const menu = new Menu();
-		const note = this.linkedNote(job);
+		const note = this.plugin.linkedNote(job.job_id);
 		if (note) menu.addItem(item => item.setTitle("打开整理稿").setIcon("external-link").onClick(() => this.app.workspace.getLeaf(false).openFile(note)));
-		if (DONE.has(job.status) && job.output_path) {
+		if (job.status === "completed" && job.output_path) {
 			menu.addItem(item => item.setTitle("复制整理命令").setIcon("copy").onClick(() => this.plugin.copyOrganizeCommand(job.output_path)));
 			menu.addItem(item => item.setTitle("打开原稿").setIcon("file-text").onClick(() => this.plugin.openTranscript(job.output_path)));
-			menu.addItem(item => item.setTitle(note ? "重新关联整理稿…" : "关联整理稿…").setIcon("link").onClick(() => this.plugin.linkNote(job.job_id)));
+			menu.addItem(item => item.setTitle(note ? "重新关联整理稿…" : "关联整理稿…").setIcon("link").onClick(() => this.plugin.chooseLinkedNote(job.job_id)));
 		}
-		if (RETRYABLE.has(job.status)) {
+		if (job.retryable) {
 			menu.addSeparator();
 			menu.addItem(item => item.setTitle("重试").setIcon("rotate-ccw").onClick(() => this.act(() => this.plugin.api.retry(job.job_id))));
 		}
 		return menu;
-	}
-
-	/** The organized note the user associated with this job, while it still exists. */
-	private linkedNote(job: Job): TFile | null {
-		const path = this.plugin.settings.archived[job.job_id];
-		const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
-		return file instanceof TFile ? file : null;
 	}
 
 	private drawWatcher(el: HTMLElement, watcher: ServiceState["watcher"]) {

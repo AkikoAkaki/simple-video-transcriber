@@ -47,7 +47,7 @@ def _is_western_char(char: str) -> bool:
     return char.isalnum() or (char.isascii() and char not in _ASCII_PUNCT and not char.isspace())
 
 
-def _needs_space_between(left: str, right: str, left_is_closing: bool = True, right_is_opening: bool = True) -> bool:
+def _needs_space_between(left: str, right: str, left_is_closing: bool, right_is_opening: bool) -> bool:
     """Whether a space belongs between two adjacent characters.
 
     A space separates a Western word or closing mark (``word``, ``word.``,

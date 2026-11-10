@@ -12,7 +12,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 import config
-from appdata import AppSettings
+from paths import is_media_file
 
 
 ERROR_SHARING_VIOLATION = 32
@@ -26,10 +26,6 @@ class FileStamp(NamedTuple):
 
 def _stamp(stat: os.stat_result) -> FileStamp:
     return FileStamp(stat.st_size, stat.st_mtime_ns)
-
-
-def _is_supported(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in config.WATCH_EXTENSIONS
 
 
 def _released(path: Path) -> bool | None:
@@ -72,9 +68,7 @@ class FileWatcher:
     # Reconcile the directory this often so a missed file is still picked up.
     RESCAN_INTERVAL_SECONDS = 60.0
 
-    def __init__(self, settings: AppSettings, on_ready: Callable[[Path], object],
-                 on_event: Callable[[str, dict], None]):
-        self.settings = settings
+    def __init__(self, on_ready: Callable[[Path], object], on_event: Callable[[str, dict], None]):
         self.on_ready = on_ready
         self.on_event = on_event
         self._pending: dict[str, tuple[int, float]] = {}
@@ -88,8 +82,8 @@ class FileWatcher:
         self._thread: threading.Thread | None = None
         self._resolved_watch_dir: Path | None = None
 
-    def start(self) -> None:
-        root = Path(self.settings.watch_dir).expanduser().resolve()
+    def start(self, folder: Path) -> None:
+        root = folder.expanduser().resolve()
         with self._lock:
             if root != self._resolved_watch_dir:
                 self._pending.clear()
@@ -105,7 +99,7 @@ class FileWatcher:
         self._start_existing(root)
 
     def _start_existing(self, root: Path) -> None:
-        self._seen_stamps = {str(p.resolve()): _stamp(p.stat()) for p in root.iterdir() if _is_supported(p)}
+        self._seen_stamps = {str(p.resolve()): _stamp(p.stat()) for p in root.iterdir() if is_media_file(p)}
         self._observer = Observer()
         self._observer.schedule(_WatchHandler(self), str(root), recursive=False)
         self._observer.start()
@@ -144,7 +138,7 @@ class FileWatcher:
             path = path.resolve()
             if path.parent != self._resolved_watch_dir:
                 return
-            if not _is_supported(path):
+            if not is_media_file(path):
                 return
             stat = path.stat()
         except OSError:
@@ -175,10 +169,10 @@ class FileWatcher:
             return
         with self._lock:
             handled = self._seen_stamps.keys() | self._pending.keys()
-        min_bytes = self.settings.min_file_size_kb * 1024
+        min_bytes = config.MIN_FILE_SIZE_KB * 1024
         for entry in entries:
             try:
-                if (not _is_supported(entry) or str(entry.resolve()) in handled
+                if (not is_media_file(entry) or str(entry.resolve()) in handled
                         or entry.stat().st_size < min_bytes):
                     continue
             except OSError:
@@ -202,7 +196,7 @@ class FileWatcher:
                 with self._lock:
                     self._pending[key] = (current, now)
                 continue
-            if now - last_changed < self.settings.stable_seconds:
+            if now - last_changed < config.STABLE_SECONDS:
                 continue
             released = _released(path)
             if released is None:
@@ -215,7 +209,7 @@ class FileWatcher:
                 continue
             with self._lock:
                 self._pending.pop(key, None)
-            if current >= self.settings.min_file_size_kb * 1024:
+            if current >= config.MIN_FILE_SIZE_KB * 1024:
                 try:
                     self.on_ready(path)
                 except Exception:
