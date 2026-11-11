@@ -1,55 +1,72 @@
 import { spawn } from "child_process";
 import { access } from "fs/promises";
-import { FileSystemAdapter, FuzzySuggestModal, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
+import { dirname, join } from "path";
+import { FileSystemAdapter, Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
 import media from "../../media_extensions.json";
-import { TranscriberApi } from "./api";
+import { APP_DATA_DIR, ApiError, TranscriberApi } from "./api";
 import { TaskView, VIEW_TYPE } from "./view";
 
 interface Settings {
-	/** Started when the panel finds no running tray. */
+	/** Starts the tray when an action needs it and it is not running. */
 	startScript: string;
-	/** job id -> vault path explicitly associated by the user; legacy archive links remain usable. */
-	archived: Record<string, string>;
+	/** Finished jobs whose organizing command was copied; the panel no longer lists them. */
+	copied: string[];
 }
 
 const DEFAULTS: Settings = {
 	startScript: "I:\\Projects\\meeting-transcriber\\start.bat",
-	archived: {},
+	copied: [],
 };
-const MEDIA = new Set([...media.audio, ...media.video].map(extension => extension.slice(1)));
+const COPIED_LIMIT = 200;
+const START_TIMEOUT_MS = 60000;
+const EXTENSIONS = [...media.audio, ...media.video];
+const MEDIA = new Set(EXTENSIONS.map(extension => extension.slice(1)));
+
+/** The disk path of a file chosen in a file dialog or dropped onto the panel. */
+function diskPath(file: File): string {
+	const legacy = (file as File & { path?: string }).path;
+	if (legacy) return legacy;
+	try {
+		const electron = require("electron") as { webUtils?: { getPathForFile(file: File): string } };
+		return electron.webUtils?.getPathForFile(file) ?? "";
+	} catch {
+		return "";
+	}
+}
+
+function formatSize(bytes: number): string {
+	const units = ["B", "KB", "MB", "GB"];
+	let size = bytes;
+	let unit = 0;
+	while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+	return unit ? `${size.toFixed(1)} ${units[unit]}` : `${size} B`;
+}
 
 export default class MeetingTranscriberPlugin extends Plugin {
-	settings: Settings = { ...DEFAULTS, archived: {} };
+	settings: Settings = { ...DEFAULTS, copied: [] };
 	api = new TranscriberApi();
+	private starting: Promise<boolean> | null = null;
 
 	async onload() {
 		const saved = await this.loadData();
-		const links: unknown = saved?.archived;
 		this.settings = {
 			startScript: typeof saved?.startScript === "string" ? saved.startScript : DEFAULTS.startScript,
-			archived: typeof links === "object" && links !== null && !Array.isArray(links)
-				? Object.fromEntries(Object.entries(links).filter(([, path]) => typeof path === "string")) : {},
+			copied: Array.isArray(saved?.copied) ? saved.copied.filter((id: unknown) => typeof id === "string") : [],
 		};
 		this.registerView(VIEW_TYPE, leaf => new TaskView(leaf, this));
 		this.addRibbonIcon("mic", "转录任务", () => this.openPanel());
 		this.addCommand({ id: "open-panel", name: "打开转录任务面板", callback: () => this.openPanel() });
-		this.addCommand({ id: "start-service", name: "启动转录服务", callback: () => this.startService() });
+		this.addCommand({ id: "choose-files", name: "转录文件…", callback: () => this.chooseFiles() });
 		// The tray's left click opens obsidian://meeting-transcriber.
 		this.registerObsidianProtocolHandler("meeting-transcriber", () => this.openPanel());
 		this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
 			if (!this.isMedia(file)) return;
-			menu.addItem(item => item.setTitle("转录").setIcon("mic").onClick(() => this.queue([file])));
+			menu.addItem(item => item.setTitle("转录").setIcon("mic").onClick(() => this.queueVaultFiles([file])));
 		}));
 		this.registerEvent(this.app.workspace.on("files-menu", (menu, files) => {
 			const media = files.filter(file => this.isMedia(file));
 			if (!media.length) return;
-			menu.addItem(item => item.setTitle(`转录 ${media.length} 个文件`).setIcon("mic").onClick(() => this.queue(media)));
-		}));
-		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-			void this.updateNoteLinks(oldPath, file.path).catch(error => new Notice(`保存关联失败：${String(error)}`));
-		}));
-		this.registerEvent(this.app.vault.on("delete", file => {
-			void this.updateNoteLinks(file.path, null).catch(error => new Notice(`保存关联失败：${String(error)}`));
+			menu.addItem(item => item.setTitle(`转录 ${media.length} 个文件`).setIcon("mic").onClick(() => this.queueVaultFiles(media)));
 		}));
 		this.addSettingTab(new TranscriberSettingTab(this));
 	}
@@ -58,64 +75,42 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	private async updateNoteLinks(oldPath: string, newPath: string | null) {
-		let changed = false;
-		for (const [id, path] of Object.entries(this.settings.archived)) {
-			if (path !== oldPath && !path.startsWith(`${oldPath}/`)) continue;
-			if (newPath === null) delete this.settings.archived[id];
-			else this.settings.archived[id] = newPath + path.slice(oldPath.length);
-			changed = true;
-		}
-		if (changed) {
-			await this.saveSettings();
-			void this.refreshViews();
-		}
+	get transcriptDir(): string {
+		return join(dirname(this.settings.startScript), "transcripts");
 	}
 
-	async refreshViews() {
-		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-			if (leaf.view instanceof TaskView) await leaf.view.refresh();
-		}
+	isCopied(jobId: string): boolean {
+		return this.settings.copied.includes(jobId);
+	}
+
+	openPath(path: string) {
+		const child = spawn("explorer.exe", [path], { stdio: "ignore", windowsHide: true });
+		child.on("error", error => new Notice(`无法打开 ${path}：${error.message}`));
+		child.unref();
 	}
 
 	async openTranscript(path: string) {
 		try {
 			await access(path);
-			const child = spawn("explorer.exe", [path], { stdio: "ignore", windowsHide: true });
-			child.on("error", error => new Notice(`无法打开原稿：${error.message}`));
-			child.unref();
+			this.openPath(path);
 		} catch (error) {
 			new Notice(`原稿不存在或无法读取：${String(error)}`);
 		}
 	}
 
-	async copyOrganizeCommand(path: string): Promise<boolean> {
+	/** Copies the organizing command; the job then leaves the panel. */
+	async copyOrganizeCommand(jobId: string, path: string): Promise<boolean> {
 		try {
 			await access(path);
 			await navigator.clipboard.writeText(`/transcript ${JSON.stringify(path)}`);
-			new Notice("已复制整理命令，请在 vault 的 OpenCode 会话中运行；原稿会保留");
-			return true;
 		} catch (error) {
 			new Notice(`无法复制整理命令：${String(error)}`);
 			return false;
 		}
-	}
-
-	/** The organized note the user associated with this job, while it still exists. */
-	linkedNote(jobId: string): TFile | null {
-		const path = this.settings.archived[jobId];
-		const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
-		return file instanceof TFile ? file : null;
-	}
-
-	chooseLinkedNote(jobId: string) {
-		new NoteModal(this, jobId).open();
-	}
-
-	async linkNote(jobId: string, file: TFile) {
-		this.settings.archived[jobId] = file.path;
+		new Notice("已复制整理命令");
+		this.settings.copied = [...this.settings.copied.filter(id => id !== jobId), jobId].slice(-COPIED_LIMIT);
 		await this.saveSettings();
-		await this.refreshViews();
+		return true;
 	}
 
 	async openPanel() {
@@ -126,26 +121,90 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		await this.app.workspace.revealLeaf(leaf);
 	}
 
-	startService() {
-		const child = spawn("cmd.exe", ["/c", this.settings.startScript], { detached: true, stdio: "ignore", windowsHide: true });
-		child.on("error", error => new Notice(`无法启动转录服务：${error.message}`));
-		child.unref();
-		new Notice("正在启动转录服务…");
+	async refreshViews() {
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
+			if (leaf.view instanceof TaskView) await leaf.view.refresh();
+		}
+	}
+
+	/** Runs an API call, starting the tray first when it is not running. */
+	async withService<T>(action: () => Promise<T>): Promise<T> {
+		try {
+			return await action();
+		} catch (error) {
+			if (!(error instanceof ApiError && error.kind === "connection")) throw error;
+		}
+		if (!await this.startService()) throw new Error("转录服务启动超时");
+		return action();
+	}
+
+	/** Starts the tray and waits until it answers; concurrent callers share one start. */
+	private startService(): Promise<boolean> {
+		this.starting ??= (async () => {
+			new Notice("正在启动转录服务…");
+			const child = spawn("cmd.exe", ["/c", this.settings.startScript], { detached: true, stdio: "ignore", windowsHide: true });
+			child.on("error", error => new Notice(`无法启动转录服务：${error.message}`));
+			child.unref();
+			const deadline = Date.now() + START_TIMEOUT_MS;
+			while (Date.now() < deadline) {
+				await new Promise(resolve => window.setTimeout(resolve, 1000));
+				try {
+					await this.api.state();
+					return true;
+				} catch {
+					// Still starting.
+				}
+			}
+			return false;
+		})().finally(() => { this.starting = null; });
+		return this.starting;
+	}
+
+	async queuePaths(paths: string[]) {
+		if (!paths.length) return;
+		try {
+			const { queued } = await this.withService(() => this.api.queue(paths));
+			new Notice(queued.length ? `已加入转录队列：${queued.length} 个文件` : "这些文件已经在队列里或转录过了");
+		} catch (error) {
+			new Notice(`无法加入转录队列：${(error as Error).message}`);
+		}
+		await this.openPanel();
+		await this.refreshViews();
+	}
+
+	chooseFiles() {
+		const input = document.body.createEl("input", { type: "file", attr: { multiple: "", accept: EXTENSIONS.join(",") } });
+		input.hide();
+		input.onchange = () => {
+			const paths = Array.from(input.files ?? [], diskPath).filter(Boolean);
+			input.remove();
+			void this.queuePaths(paths);
+		};
+		input.oncancel = () => input.remove();
+		input.click();
+	}
+
+	/** Media files among those dropped onto the panel. */
+	droppedPaths(files: FileList): string[] {
+		return Array.from(files, diskPath).filter(path => MEDIA.has(path.split(".").pop()?.toLowerCase() ?? ""));
 	}
 
 	private isMedia(file: TAbstractFile): file is TFile {
 		return file instanceof TFile && MEDIA.has(file.extension.toLowerCase());
 	}
 
-	private async queue(files: TFile[]) {
+	private async queueVaultFiles(files: TFile[]) {
 		const adapter = this.app.vault.adapter;
 		if (!(adapter instanceof FileSystemAdapter)) return;
+		await this.queuePaths(files.map(file => adapter.getFullPath(file.path)));
+	}
+
+	async clearAudioCache() {
 		try {
-			const { queued } = await this.api.queue(files.map(file => adapter.getFullPath(file.path)));
-			new Notice(queued.length ? `已加入转录队列：${queued.length} 个文件` : "这些文件已经在队列里或转录过了");
-			await this.openPanel();
+			const { deleted_count, reclaimed_bytes } = await this.withService(() => this.api.clearCache());
+			new Notice(`已删除 ${deleted_count} 个音频缓存，释放 ${formatSize(reclaimed_bytes)}`);
 		} catch (error) {
-			new Notice(`转录服务没有响应：${(error as Error).message}`);
+			new Notice(`清理失败：${(error as Error).message}`);
 		}
 	}
 }
@@ -160,7 +219,7 @@ class TranscriberSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		new Setting(containerEl)
 			.setName("启动脚本")
-			.setDesc("面板发现转录服务没有运行时，用它启动托盘。")
+			.setDesc("需要转录服务时用它启动托盘；托盘空闲 3 分钟后自动退出。")
 			.addText(text => text.setValue(this.plugin.settings.startScript).onChange(async value => {
 				this.plugin.settings.startScript = value.trim();
 				await this.plugin.saveSettings();
@@ -176,28 +235,18 @@ class TranscriberSettingTab extends PluginSettingTab {
 			.addButton(button => button.setButtonText("保存").onClick(async () => {
 				if (!token) return;
 				try {
-					await this.plugin.api.setToken(token);
+					await this.plugin.withService(() => this.plugin.api.setToken(token));
 					new Notice("Token 已保存");
 				} catch (error) {
 					new Notice(`保存失败：${(error as Error).message}`);
 				}
 			}));
-	}
-}
-
-class NoteModal extends FuzzySuggestModal<TFile> {
-	constructor(private readonly plugin: MeetingTranscriberPlugin, private readonly jobId: string) {
-		super(plugin.app);
-		this.setPlaceholder("选择已经整理好的笔记；关联不会修改文件");
-	}
-	getItems() { return this.app.vault.getMarkdownFiles(); }
-	getItemText(file: TFile) { return file.path; }
-	async onChooseItem(file: TFile) {
-		try {
-			await this.plugin.linkNote(this.jobId, file);
-			new Notice(`已关联 ${file.path}`);
-		} catch (error) {
-			new Notice(`关联失败：${String(error)}`);
-		}
+		new Setting(containerEl)
+			.setName("音频缓存")
+			.setDesc("只删除已结束任务的 WAV，识别缓存和转录稿不受影响。")
+			.addButton(button => button.setButtonText("清理").onClick(() => this.plugin.clearAudioCache()));
+		new Setting(containerEl)
+			.setName("日志")
+			.addButton(button => button.setButtonText("打开日志文件夹").onClick(() => this.plugin.openPath(join(APP_DATA_DIR, "logs"))));
 	}
 }

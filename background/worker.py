@@ -21,8 +21,6 @@ from protocol import EVENT_COMPLETED, EVENT_FAILED, SERVER_READY, JobRequest, pa
 
 
 _WORKER_START_TIMEOUT_SECONDS = 30.0
-# Python and CUDA keep a finished worker's memory; only exiting returns it to the system.
-_WORKER_IDLE_EXIT_SECONDS = 180.0
 _ERROR_MARKERS = ("error", "traceback", "could not load", "cannot load", "invalid handle", "fatal")
 
 
@@ -57,6 +55,13 @@ class WorkerController:
             self.on_event("log", {"message": f"Worker will outlive a crashed tray: {exc}"})
         self._thread = threading.Thread(target=self._run_loop, name="transcription-worker", daemon=True)
         self._thread.start()
+
+    def idle_seconds(self) -> float:
+        """How long nothing has been running or waiting; 0 while there is work."""
+        with self._lock:
+            if self._active or self._queue:
+                return 0.0
+            return time.monotonic() - self._idle_since
 
     def enqueue(self, job_id: str) -> None:
         with self._lock:
@@ -132,9 +137,10 @@ class WorkerController:
                     self._idle_since = time.monotonic()
 
     def _retire_idle_worker(self) -> None:
+        """Python and CUDA keep a finished worker's memory; only exiting returns it to the system."""
         with self._lock:
             proc = self._proc
-            if proc is None or time.monotonic() - self._idle_since < _WORKER_IDLE_EXIT_SECONDS:
+            if proc is None or time.monotonic() - self._idle_since < config.IDLE_EXIT_SECONDS:
                 return
         self._discard_proc(proc)
         self.on_event("log", {"message": "Worker exited after being idle; models released"})

@@ -15,7 +15,6 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def test_api_queues_each_recording_once_and_only_with_the_secret(tmp_path, monkeypatch):
-    appdata.AppSettings(watch_dir=str(tmp_path / "watch"), watcher_enabled=False).save()
     monkeypatch.setattr(config, "API_PORT", 0)
     svc = BackgroundService(lambda _event, _payload: None)
     server = ApiServer(svc)
@@ -41,6 +40,9 @@ def test_api_queues_each_recording_once_and_only_with_the_secret(tmp_path, monke
         assert sorted(Path(row["source_path"]).name for row in svc.store.queued()) == ["first.m4a", "second.mp4"]
         state = call("/api/state", secret=secret)
         assert sorted(Path(job["source_path"]).name for job in state["recent"]) == ["first.m4a", "second.mp4"]
+        # The plugin shows this file once the tray has exited.
+        history = json.loads((appdata.APP_DATA_DIR / "history.json").read_text(encoding="utf-8"))
+        assert sorted(job["job_id"] for job in history) == sorted(job["job_id"] for job in state["recent"])
     finally:
         server.stop()
         svc.stop()

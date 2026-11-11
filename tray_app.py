@@ -2,7 +2,7 @@
 """Tray controller: menu, notifications, and the local API. The task list lives in the Obsidian plugin.
 
 The tray process stays light: it imports no Torch or ML package. The heavy work runs in
-``transcribe.py`` child processes.
+``transcribe.py`` child processes. It exits by itself once idle; the Explorer menu and the plugin start it again.
 """
 
 from __future__ import annotations
@@ -11,8 +11,8 @@ import ctypes
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QLockFile, QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon
 
 import appdata
@@ -24,8 +24,8 @@ from protocol import overall_progress
 BLUE, GREEN, RED = "#3b82f6", "#22c55e", "#ef4444"
 # Opens the task panel of the Obsidian plugin, which registers this URI.
 PANEL_URI = "obsidian://meeting-transcriber"
-MEDIA_FILTER = "音视频 (" + " ".join(f"*{ext}" for ext in sorted(config.WATCH_EXTENSIONS)) + ")"
-_ICON_FOR_EVENT = {"queued": BLUE, "started": BLUE, "stage": BLUE, "completed": GREEN, "failed": RED, "watch_error": RED}
+MEDIA_FILTER = "音视频 (" + " ".join(f"*{ext}" for ext in sorted(config.MEDIA_EXTENSIONS)) + ")"
+_ICON_FOR_EVENT = {"queued": BLUE, "started": BLUE, "stage": BLUE, "completed": GREEN, "failed": RED}
 
 
 def _format_size(num_bytes: int) -> str:
@@ -84,6 +84,9 @@ class TrayApp(QObject):
         self.tray.activated.connect(self._activated)
         self.tray.messageClicked.connect(lambda: self._on_message_click())
         self.event_received.connect(self._handle_event)
+        self.idle_timer = QTimer(self)
+        self.idle_timer.setInterval(5000)
+        self.idle_timer.timeout.connect(self._exit_when_idle)
 
     def acquire(self) -> bool:
         appdata.APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -95,6 +98,11 @@ class TrayApp(QObject):
         self.api = ApiServer(self.service)
         self.api.start()
         self._update_tooltip()
+        self.idle_timer.start()
+
+    def _exit_when_idle(self) -> None:
+        if self.service.idle_seconds() >= config.IDLE_EXIT_SECONDS:
+            self.quit()
 
     def _notify(self, title: str, message: str, on_click, icon=QSystemTrayIcon.MessageIcon.Information) -> None:
         self._on_message_click = on_click
@@ -105,7 +113,7 @@ class TrayApp(QObject):
             _open_panel()
 
     def _fill_menu(self) -> None:
-        """Rebuilt on every open, so it always shows the current task and waiting recordings."""
+        """Rebuilt on every open, so it always shows the current task."""
         menu, service = self.menu, self.service
         menu.clear()
         active = service.active_job()
@@ -117,19 +125,8 @@ class TrayApp(QObject):
             menu.addAction("空闲").setEnabled(False)
         menu.addAction("打开任务面板（Obsidian）", _open_panel)
         menu.addAction("转录文件…", self._choose_files)
-        offered = service.offered_recordings()
-        if offered:
-            recordings = menu.addMenu(f"新录屏（{len(offered)}）")
-            for path in offered:
-                recordings.addAction(Path(path).name, lambda p=path: service.accept_recording(p))
-            recordings.addSeparator()
-            recordings.addAction("全部忽略", lambda: [service.dismiss_recording(p) for p in offered])
         menu.addAction("取消当前任务", service.cancel_active).setEnabled(bool(active))
         menu.addSeparator()
-        watch = QAction("监听 OBS 录制目录", menu, checkable=True, checked=service.settings.watcher_enabled)
-        watch.toggled.connect(self._set_watching)
-        menu.addAction(watch)
-        menu.addAction("更改监听目录…", self._choose_watch_dir)
         menu.addAction("设置 HuggingFace Token…", self._set_token)
         menu.addAction("清理音频缓存…", self._clear_audio_cache)
         menu.addSeparator()
@@ -142,15 +139,6 @@ class TrayApp(QObject):
         if paths:
             rows = self.service.add_files(paths)
             self._notify("已加入队列", f"{len(rows)} 个文件等待转录", _open_panel)
-
-    def _set_watching(self, enabled: bool) -> None:
-        self.service.set_watcher_enabled(enabled)
-        self._update_tooltip()
-
-    def _choose_watch_dir(self) -> None:
-        folder = QFileDialog.getExistingDirectory(None, "选择 OBS 录制目录", self.service.settings.watch_dir)
-        if folder:
-            self.service.set_watch_dir(Path(folder))
 
     def _set_token(self) -> None:
         token, ok = QInputDialog.getText(None, "HuggingFace Token", "说话人分离需要 HuggingFace Token：",
@@ -186,17 +174,16 @@ class TrayApp(QObject):
 
     def _update_tooltip(self) -> None:
         active = self.service.active_job()
-        if active:
-            state = f"正在转录 {Path(active['source_path']).name}"
-        else:
-            state = "监听中" if self.service.settings.watcher_enabled else "监听已暂停"
+        state = f"正在转录 {Path(active['source_path']).name}" if active else "空闲，稍后自动退出"
         self.tray.setToolTip(f"Meeting Transcriber · {state}")
 
     def quit(self) -> None:
+        self.idle_timer.stop()
         if self.service.active_job():
             answer = QMessageBox.question(None, "任务正在运行", "停止当前任务并退出吗？",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
+                self.idle_timer.start()
                 return
         if self.api:
             self.api.stop()

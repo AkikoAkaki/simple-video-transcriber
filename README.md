@@ -7,9 +7,8 @@ A personal Windows tool that turns OBS meeting recordings, iPhone Voice Memos, a
 ## Use
 
 - **Right-click:** in Explorer, right-click an audio or video file and choose 转录 (on Windows 11 it is under "Show more options"). The file is queued, and the tray starts if it is not running. Run `setup_context_menu.ps1` once to add the entry.
-- **Tray menu:** right-click the tray icon to pick files, cancel the current task, toggle the watcher, change the watch folder, save the HuggingFace token, or clear the audio cache. Left-click opens the task panel in Obsidian.
-- **OBS recordings:** with the watcher on, a finished new recording in the watch folder is not transcribed right away. A notification asks first; click it, or choose 转录 in the tray's 新录屏 menu or the Obsidian panel, to queue it. Recordings already present at startup are ignored.
-- **Obsidian panel:** the plugin in `obsidian-plugin/` shows the current task, new recordings, and recent tasks. It cancels and retries tasks. For completed tasks, open the raw transcript, copy a `/transcript` command containing its full path, or associate an existing organized note. Run the copied command in your vault's OpenCode session with your existing `transcript` custom command; the plugin does not run an agent in the background. Raw transcripts stay in `transcripts/`. Associated note paths follow vault renames and moves. Audio and video files inside the vault also get a 转录 entry in their context menu.
+- **Tray:** runs only while there is work. It exits after 3 idle minutes, when the worker has released its models; the Explorer menu and the Obsidian plugin start it again when needed. While it runs, right-click its icon to pick files, cancel the current task, save the HuggingFace token, or clear the audio cache.
+- **Obsidian panel:** the plugin in `obsidian-plugin/` covers everyday use on its own. Click 转录文件… or drop recordings onto the panel to queue them; the tray starts if it is not running. The panel shows the current task and one history list of completed, failed, and cancelled tasks; failures show their reason and can be retried. Click a file name to open the raw transcript. Copying a task's `/transcript` command removes it from the panel. After the tray exits, the panel shows the `history.json` it left behind. The settings tab saves the token, clears the audio cache, and opens the log folder. Run the copied command in your vault's OpenCode session with your existing `transcript` custom command; the plugin does not run an agent in the background. Raw transcripts stay in `transcripts/`. Audio and video files inside the vault also get a 转录 entry in their context menu.
 - **Agents / CLI:** call `transcribe.py`. It uses the same pipeline as the tray. Success exits with code 0; failure exits with a nonzero code.
 
 A Windows notification appears when a task ends; clicking it opens the Obsidian panel. Output names retain source fingerprints to distinguish replaced files such as repeated `New Recording 4` recordings. A retry reuses the task's original settings and the current token; the source recording must still exist and match the original file version, so import a replaced recording as a new task.
@@ -40,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File setup_context_menu.ps1
 
 Obsidian plugin: in `obsidian-plugin/`, run `npm install` and `npm run deploy`, which copies the build into `E:/obsidian-vault/.obsidian/plugins/meeting-transcriber` (set `VAULT_PLUGIN_DIR` for another vault), then enable Meeting Transcriber under Community plugins. The tray publishes its port and secret as `api_port` and `api_token` in `%LOCALAPPDATA%/SimpleVideoTranscriber/`, and the plugin reads both; change the port with `API_PORT` in `config.py`. Web pages cannot read those files, so they cannot queue files.
 
-The panel polls every 2 seconds while work is queued or running and every 15 seconds when idle or unavailable. Polling pauses while the panel or document is hidden and resumes when shown. Requests have a 10-second deadline that closes the connection. Timed-out actions are not automatically retried: check task state before submitting again. Authentication and response errors are shown separately from connection failures.
+The panel polls every 2 seconds while work is queued or running and every 15 seconds when idle, and stops once the tray has exited. Polling pauses while the panel or document is hidden and resumes when shown. Requests have a 10-second deadline that closes the connection. Timed-out actions are not automatically retried: check task state before submitting again. Authentication and response errors are shown separately from connection failures.
 
 ## Command line
 
@@ -58,13 +57,13 @@ python transcribe.py "meeting.mp4" --diarize-only
 ## Files and settings
 
 - `transcripts/`: raw results used by the separate organization workflow. The plugin does not move, rewrite, or delete these files. Markdown is fully written before replacing the destination; write failures preserve the existing file.
-- `cache/`: intermediate audio and recognition, diarization, and merged results. The tray's 清理音频缓存 removes only audio associated with terminal jobs, preserving JSON and Markdown.
-- `%LOCALAPPDATA%/SimpleVideoTranscriber/`: tray settings, the job database, text logs, the local API port and secret (`api_port`, `api_token`), and the Parakeet model.
+- `cache/`: intermediate audio and recognition, diarization, and merged results. 清理音频缓存 removes only audio associated with terminal jobs, preserving JSON and Markdown.
+- `%LOCALAPPDATA%/SimpleVideoTranscriber/`: the job database, recent jobs for the plugin (`history.json`), text logs, the local API port and secret (`api_port`, `api_token`), and the Parakeet model.
 
 CLI and tray tasks cannot process the same recording version concurrently. If another task is using it, transcription fails with an audio-cache-in-use error; retry after that task finishes. Clearing the audio cache skips WAVs in use.
 
-`config.py` supplies the defaults for every task, and CLI arguments override them. `settings.json` holds only the tray's watch folder and whether it is watching. The default Whisper model is `large-v3-turbo`, with `large-v3` also available, for jobs that use Whisper; the default device is `auto`. The watch folder defaults to the user's Videos directory and can be changed from the tray menu or defaulted through `MEETING_TRANSCRIBER_WATCH_DIR`.
+`config.py` supplies the defaults for every task, and CLI arguments override them. The default Whisper model is `large-v3-turbo`, with `large-v3` also available, for jobs that use Whisper; the default device is `auto`.
 
 Transcription settings are captured when a task is queued. Missing tokens fail early unless a valid diarization cache exists. Matching recognition and diarization caches bypass audio extraction and model execution.
 
-The watcher waits for roughly 15 seconds of stable file size and checks whether the file can be opened. This is a recording-completion heuristic; paused recordings or transfers can trigger early. Source audio/video is neither moved nor deleted, and media links are not added automatically.
+Source audio/video is neither moved nor deleted, and media links are not added automatically.

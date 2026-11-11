@@ -21,8 +21,6 @@ export type Job = Record<(typeof JOB_TEXT_FIELDS)[number], string> & {
 export interface ServiceState {
 	active: Job | null;
 	recent: Job[];
-	offered: string[];
-	watcher: { enabled: boolean; dir: string };
 	steps: string[];
 }
 
@@ -40,17 +38,28 @@ function isJob(value: unknown): value is Job {
 function isState(value: unknown): value is ServiceState {
 	return isRecord(value) && (value.active === null || isJob(value.active))
 		&& Array.isArray(value.recent) && value.recent.every(isJob)
-		&& Array.isArray(value.offered) && value.offered.every(path => typeof path === "string")
-		&& isRecord(value.watcher) && typeof value.watcher.enabled === "boolean" && typeof value.watcher.dir === "string"
 		&& Array.isArray(value.steps) && value.steps.every(step => typeof step === "string");
 }
 
-/** A value the tray publishes in its app data folder when it starts. */
+/** The tray's app data folder (appdata.APP_DATA_DIR). */
+export const APP_DATA_DIR = join(process.env.LOCALAPPDATA ?? "", "SimpleVideoTranscriber");
+
+/** A value the tray publishes in its app data folder. */
 async function readPublished(name: string): Promise<string> {
 	try {
-		return (await readFile(join(process.env.LOCALAPPDATA ?? "", "SimpleVideoTranscriber", name), "utf8")).trim();
+		return (await readFile(join(APP_DATA_DIR, name), "utf8")).trim();
 	} catch {
 		return "";
+	}
+}
+
+/** The recent jobs the tray last published, readable after it has exited. */
+export async function readHistory(): Promise<Job[]> {
+	try {
+		const jobs: unknown = JSON.parse(await readPublished("history.json"));
+		return Array.isArray(jobs) ? jobs.filter(isJob) : [];
+	} catch {
+		return [];
 	}
 }
 
@@ -104,8 +113,12 @@ export class TranscriberApi {
 	}
 	retry = (jobId: string) => this.call("POST", `/api/jobs/${encodeURIComponent(jobId)}/retry`, {});
 	cancel = () => this.call("POST", "/api/cancel", {});
-	accept = (path: string) => this.call("POST", "/api/recordings/accept", { path });
-	dismiss = (path: string) => this.call("POST", "/api/recordings/dismiss", { path });
-	setWatching = (enabled: boolean) => this.call("POST", "/api/watcher", { enabled });
 	setToken = (token: string) => this.call("POST", "/api/token", { token });
+	async clearCache(): Promise<{ deleted_count: number; reclaimed_bytes: number }> {
+		const result = await this.call("POST", "/api/cache/clear", {});
+		if (!isRecord(result) || typeof result.deleted_count !== "number" || typeof result.reclaimed_bytes !== "number") {
+			throw new Error("转录服务返回了无效的清理结果");
+		}
+		return { deleted_count: result.deleted_count, reclaimed_bytes: result.reclaimed_bytes };
+	}
 }

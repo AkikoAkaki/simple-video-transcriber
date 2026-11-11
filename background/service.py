@@ -1,4 +1,4 @@
-"""The always-on core behind the tray: watch folder, durable job state, and the serial worker queue.
+"""The core behind the tray: durable job state and the serial worker queue.
 
 It imports no Qt, so the API and tests drive it directly.
 """
@@ -9,62 +9,42 @@ import threading
 from pathlib import Path
 from typing import Callable
 
-from appdata import AppSettings, TokenStore
+import appdata
+from appdata import TokenStore
 from background import jobs
 from background.activity_log import ActivityLog
-from background.jobs import RETRYABLE, CacheCleanup, JobStore, job_options
-from background.watcher import FileWatcher
+from background.jobs import RETRYABLE, CacheCleanup, JobStore, job_options, public_job
 from background.worker import WorkerController
 from paths import SourceChangedError, is_media_file, source_identity
 from protocol import JobOptions
 
 
+RECENT_JOBS = 20
+# Events after which the published history no longer matches the job store.
+_JOB_CHANGES = frozenset({"service_started", "queued", "started", "cancel_requested", "completed", "failed", "cancelled"})
+
+
 class BackgroundService:
     def __init__(self, on_event: Callable[[str, dict], None]):
-        self.settings = AppSettings.load()
         self.store = JobStore()
         self.token_store = TokenStore()
         self.on_event = on_event
         self._log = ActivityLog(self.token_store)
         self.worker = WorkerController(self.store, self.token_store, self._event)
-        self.watcher = FileWatcher(self._recording_ready, self._event)
-        self._offers: dict[str, Path] = {}
-        self._offers_lock = threading.Lock()
+        self._history_lock = threading.Lock()
 
     def start(self) -> None:
         self.store.recover_interrupted()
         self.worker.start()
-        if self.settings.watcher_enabled:
-            self._watch()
-        else:
-            self._event("watch_stopped", {"message": "Watcher paused"})
         for row in self.store.queued():
             self.worker.enqueue(row["job_id"])
         self._event("service_started", {"message": "Background service started"})
 
     def stop(self) -> None:
-        self.watcher.stop()
         self.worker.stop()
 
-    def _watch(self) -> None:
-        self.watcher.start(Path(self.settings.watch_dir))
-
-    def set_watcher_enabled(self, enabled: bool) -> None:
-        self.settings.watcher_enabled = enabled
-        self.settings.save()
-        if enabled:
-            self._watch()
-        else:
-            self.watcher.stop()
-            self._event("watch_stopped", {"message": "Watcher paused"})
-
-    def set_watch_dir(self, path: Path) -> None:
-        was_enabled = self.settings.watcher_enabled
-        self.watcher.stop()
-        self.settings.watch_dir = str(path)
-        self.settings.save()
-        if was_enabled:
-            self._watch()
+    def idle_seconds(self) -> float:
+        return self.worker.idle_seconds()
 
     def add_files(self, paths) -> list[dict]:
         """Queue each audio or video file once; folders, other files, and repeats are skipped."""
@@ -76,36 +56,10 @@ class BackgroundService:
             if key in seen:
                 continue
             seen.add(key)
-            with self._offers_lock:
-                self._offers.pop(key, None)
             row = self._enqueue(path, JobOptions())
             if row:
                 rows.append(row)
         return rows
-
-    def _recording_ready(self, path: Path) -> None:
-        """Offer a finished recording instead of queueing it: most OBS recordings need no transcript."""
-        if self.store.knows(path):
-            return
-        key = str(path.resolve())
-        with self._offers_lock:
-            if key in self._offers:
-                return
-            self._offers[key] = path
-        self._event("recording_ready", {"path": key, "message": f"New recording: {path.name}"})
-
-    def offered_recordings(self) -> list[str]:
-        with self._offers_lock:
-            return list(self._offers)
-
-    def accept_recording(self, path: str) -> dict | None:
-        with self._offers_lock:
-            recording = self._offers.pop(path, None)
-        return self._enqueue(recording, JobOptions()) if recording else None
-
-    def dismiss_recording(self, path: str) -> None:
-        with self._offers_lock:
-            self._offers.pop(path, None)
 
     def retry_job(self, job_id: str) -> dict | None:
         row = self.store.get(job_id)
@@ -148,4 +102,13 @@ class BackgroundService:
 
     def _event(self, event: str, payload: dict) -> None:
         self._log.write(event, payload)
+        if event in _JOB_CHANGES:
+            self._publish_history()
         self.on_event(event, payload)
+
+    def _publish_history(self) -> None:
+        with self._history_lock:
+            try:
+                appdata.publish_history([public_job(row) for row in self.store.recent(RECENT_JOBS)])
+            except OSError as exc:
+                self._log.write("log", {"message": f"Could not publish task history: {exc}"})
