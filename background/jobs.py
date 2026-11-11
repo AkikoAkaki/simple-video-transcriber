@@ -16,7 +16,7 @@ from typing import Iterable, NamedTuple
 import appdata
 import config
 from paths import audio_cache_lock, fingerprint, partial_path, source_identity, wav_cache_path
-from protocol import JobOptions
+from protocol import JobOptions, overall_progress, step_of
 
 
 class JobStatus(StrEnum):
@@ -40,6 +40,19 @@ def _now() -> str:
 
 def job_options(row: dict) -> JobOptions:
     return JobOptions.parse(json.loads(row["options_json"] or "{}"))
+
+
+# The job fields clients see; obsidian-plugin/src/api.ts mirrors them.
+_PUBLIC_FIELDS = ("job_id", "source_path", "status", "message", "output_path", "error", "created_at", "finished_at")
+
+
+def public_job(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    return {**{name: row.get(name) for name in _PUBLIC_FIELDS},
+            "overall_progress": overall_progress(row["stage"], row["progress"]),
+            "step": step_of(row["stage"]),
+            "retryable": row["status"] in RETRYABLE}
 
 
 class CacheCleanup(NamedTuple):

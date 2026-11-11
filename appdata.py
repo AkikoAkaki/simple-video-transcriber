@@ -1,8 +1,8 @@
-"""Per-user application data: settings, secrets, and file locations.
+"""Per-user application data: secrets, published state, and file locations.
 
 Every path derives from ``APP_DATA_DIR`` when it is used, so redirecting that one
-attribute moves all of them. The folder name and the ``api_port`` and ``api_token`` file names are also
-read by obsidian-plugin/src/api.ts.
+attribute moves all of them. The folder name and the ``api_port``, ``api_token`` and ``history.json``
+file names are also read by obsidian-plugin/src/api.ts.
 """
 
 from __future__ import annotations
@@ -10,10 +10,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
-from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-import config
 from paths import write_atomic
 
 
@@ -30,29 +28,6 @@ def log_dir() -> Path:
 
 def models_dir() -> Path:
     return APP_DATA_DIR / "models"
-
-
-def _settings_file() -> Path:
-    return APP_DATA_DIR / "settings.json"
-
-
-@dataclass
-class AppSettings:
-    watch_dir: str = str(config.WATCH_DIR)
-    watcher_enabled: bool = True
-
-    @classmethod
-    def load(cls) -> AppSettings:
-        try:
-            data = json.loads(_settings_file().read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return cls()
-        if not isinstance(data, dict):
-            return cls()
-        return cls(**{f.name: data[f.name] for f in fields(cls) if f.name in data})
-
-    def save(self) -> None:
-        write_atomic(_settings_file(), json.dumps(asdict(self), ensure_ascii=False, indent=2))
 
 
 class TokenStore:
@@ -122,3 +97,8 @@ def load_api_secret(create: bool = False) -> str:
 def publish_api_port(port: int) -> None:
     """Tell clients outside this codebase, such as the Obsidian plugin, where the running tray listens."""
     write_atomic(APP_DATA_DIR / "api_port", str(port))
+
+
+def publish_history(jobs: list[dict]) -> None:
+    """Recent jobs for the Obsidian plugin to show after the tray has exited."""
+    write_atomic(APP_DATA_DIR / "history.json", json.dumps(jobs, ensure_ascii=False))

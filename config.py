@@ -1,14 +1,9 @@
-"""Defaults for the tray and the CLI. The tray saves only its watch folder and whether it is watching."""
+"""Defaults for the tray and the CLI."""
 import json
-import os
 from pathlib import Path
 
 # ── Directories ──────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).parent.resolve()
-
-# OBS recordings are watched by the tray service. Override this on another
-# machine with MEETING_TRANSCRIBER_WATCH_DIR.
-WATCH_DIR = Path(os.environ.get("MEETING_TRANSCRIBER_WATCH_DIR", Path.home() / "Videos"))
 
 # Transcripts are written here as Markdown files
 TRANSCRIPT_DIR = ROOT_DIR / "transcripts"
@@ -45,14 +40,10 @@ DEVICE = "auto"
 # The Explorer "转录" menu and the Obsidian plugin reach the tray on this 127.0.0.1 port.
 API_PORT = 47321
 
-# ── Watcher ──────────────────────────────────────────────────────────────────
-# Files smaller than this are ignored (filters out accidental tiny files).
-MIN_FILE_SIZE_KB = 100
+# The tray exits once it has had nothing to do for this long, after the worker
+# has already released its models; the Explorer menu and the plugin restart it.
+IDLE_EXIT_SECONDS = 180
 
-# A recording counts as finished once its size has held still this long.
-STABLE_SECONDS = 15
-
-# The Explorer menu and the Obsidian plugin offer only audio and video: .ts on a
-# developer machine is far more often TypeScript than a video stream.
+# Shared with the Obsidian plugin, which offers the same files.
 _MEDIA = json.loads((ROOT_DIR / "media_extensions.json").read_text(encoding="utf-8"))
-WATCH_EXTENSIONS = {*_MEDIA["audio"], *_MEDIA["video"], *_MEDIA["watch_only"]}
+MEDIA_EXTENSIONS = {*_MEDIA["audio"], *_MEDIA["video"]}

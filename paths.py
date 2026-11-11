@@ -66,7 +66,7 @@ def source_fingerprint(input_path: Path) -> str:
 
 
 def is_media_file(path: Path) -> bool:
-    return path.suffix.lower() in config.WATCH_EXTENSIONS and path.is_file()
+    return path.suffix.lower() in config.MEDIA_EXTENSIONS and path.is_file()
 
 
 def wav_cache_path(source_stem: str, source_fp: str) -> Path:

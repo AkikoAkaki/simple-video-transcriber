@@ -3,7 +3,7 @@
 It listens on 127.0.0.1 only, and every request must carry the secret from ``appdata.load_api_secret``.
 A web page can reach localhost, but it cannot read that file, so it cannot queue files.
 
-The Job fields here are mirrored by obsidian-plugin/src/api.ts.
+The job fields come from ``background.jobs.public_job``.
 """
 
 from __future__ import annotations
@@ -17,30 +17,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import appdata
 import config
-from background.jobs import RETRYABLE
-from protocol import STEP_LABELS, overall_progress, step_of
+from background.jobs import public_job
+from background.service import RECENT_JOBS
+from protocol import STEP_LABELS
 
-_JOB_FIELDS = ("job_id", "source_path", "status", "message", "output_path", "error",
-               "created_at", "finished_at")
 _MAX_BODY = 1 << 20
-_RECENT_JOBS = 20
-
-
-def _job(row: dict | None) -> dict | None:
-    if not row:
-        return None
-    return {**{name: row.get(name) for name in _JOB_FIELDS},
-            "overall_progress": overall_progress(row["stage"], row["progress"]),
-            "step": step_of(row["stage"]),
-            "retryable": row["status"] in RETRYABLE}
 
 
 def snapshot(service) -> dict:
     return {
-        "active": _job(service.active_job()),
-        "recent": [_job(row) for row in service.recent_jobs(_RECENT_JOBS)],
-        "offered": service.offered_recordings(),
-        "watcher": {"enabled": service.settings.watcher_enabled, "dir": service.settings.watch_dir},
+        "active": public_job(service.active_job()),
+        "recent": [public_job(row) for row in service.recent_jobs(RECENT_JOBS)],
         "steps": STEP_LABELS,
     }
 
@@ -54,10 +41,8 @@ def _routes(service) -> dict:
         ("POST", r"/api/jobs"): lambda body: queued(*service.add_files(body.get("paths") or [])),
         ("POST", r"/api/jobs/([\w-]+)/retry"): lambda body, job_id: queued(service.retry_job(job_id)),
         ("POST", r"/api/cancel"): lambda body: service.cancel_active() or {},
-        ("POST", r"/api/recordings/accept"): lambda body: queued(service.accept_recording(str(body.get("path", "")))),
-        ("POST", r"/api/recordings/dismiss"): lambda body: service.dismiss_recording(str(body.get("path", ""))) or {},
-        ("POST", r"/api/watcher"): lambda body: service.set_watcher_enabled(bool(body.get("enabled"))) or {},
         ("POST", r"/api/token"): lambda body: service.set_token(str(body.get("token", ""))) or {},
+        ("POST", r"/api/cache/clear"): lambda body: service.clear_audio_cache()._asdict(),
     }
 
 
